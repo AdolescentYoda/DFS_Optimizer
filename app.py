@@ -41,6 +41,8 @@ APP_DIR = (
     Path(__file__).parent.resolve() if "__file__" in locals() else Path.cwd()
 )
 DEFAULT_VEGAS_FILE = APP_DIR / "NFL Current Week Projections.xlsx"
+DEFAULT_FD_FILE = APP_DIR / "FanDuel.csv"
+DEFAULT_ESPN_FILE = APP_DIR / "espn_projections.csv"
 
 # Standard NFL Team Dictionary for Canonical Defense Matching
 NFL_TEAMS = {
@@ -87,7 +89,29 @@ NFL_TEAMS = {
 
 
 # -----------------------------------------------------------------------------
-# 2. HELPER UTILITIES & DATA PARSERS
+# 2. API CACHING LOGIC (24-Hour TTL)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=86400)
+def fetch_odds_api_data(api_key: str):
+  """Fetches live odds/projections data from The Odds API.
+
+  Streamlit caches this in memory for 24 hours (86,400 seconds).
+  """
+  import requests
+
+  url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
+  params = {
+      "apiKey": api_key,
+      "regions": "us",
+      "markets": "h2h,spreads,totals",
+  }
+  response = requests.get(url, params=params)
+  response.raise_for_status()
+  return response.json()
+
+
+# -----------------------------------------------------------------------------
+# 3. HELPER UTILITIES & DATA PARSERS
 # -----------------------------------------------------------------------------
 def excel_col_index(col_str: str) -> int:
   """Converts Excel column letters (e.g., 'A', 'J', 'AA') to zero-based index."""
@@ -201,7 +225,7 @@ def get_canonical_key(name, team="", position=""):
 
 
 # -----------------------------------------------------------------------------
-# 3. OWNERSHIP MODELING
+# 4. OWNERSHIP MODELING
 # -----------------------------------------------------------------------------
 def calculate_estimated_ownership(df: pd.DataFrame) -> pd.DataFrame:
   """Calculates realistic DFS projected ownership (%) based on market attraction score."""
@@ -302,7 +326,7 @@ def calculate_estimated_ownership(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# 4. WORKBOOK & DATA READERS
+# 5. WORKBOOK & DATA READERS
 # -----------------------------------------------------------------------------
 PROJECTED_SCORE_COLUMNS = {
     "Quarterbacks (QB)": ("QB", "L"),
@@ -326,6 +350,9 @@ def load_fd_csv(fd_file=None):
   if fd_file is not None:
     fd_source = BytesIO(fd_file.getvalue())
     fd_display_name = fd_file.name
+  elif DEFAULT_FD_FILE.exists():
+    fd_source = str(DEFAULT_FD_FILE)
+    fd_display_name = DEFAULT_FD_FILE.name
   else:
     candidates = [
         APP_DIR / f
@@ -718,7 +745,7 @@ def load_combined_data(
 
 
 # -----------------------------------------------------------------------------
-# 5. SIDEBAR CONFIGURATION & CONTROLS
+# 6. SIDEBAR CONFIGURATION & CONTROLS
 # -----------------------------------------------------------------------------
 st.sidebar.header("📁 Data Sources")
 uploaded_fd = st.sidebar.file_uploader(
@@ -730,6 +757,18 @@ uploaded_espn = st.sidebar.file_uploader(
 uploaded_vegas = st.sidebar.file_uploader(
     "Upload Vegas Workbook (.xlsx)", type=["xlsx"]
 )
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚡ Live API Controls")
+
+odds_api_key = st.sidebar.text_input(
+    "Odds API Key", value=st.secrets.get("ODDS_API_KEY", ""), type="password"
+)
+
+if st.sidebar.button("🔄 Force Fresh API Pull"):
+  fetch_odds_api_data.clear()
+  st.sidebar.success("API Cache Cleared!")
+  st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 Post-Mortem Snapshot")
@@ -776,7 +815,7 @@ global_risk_mult = st.sidebar.slider(
 )
 
 # -----------------------------------------------------------------------------
-# 6. MASTER DATA LOAD & SIMULATION ENGINE
+# 7. MASTER DATA LOAD & SIMULATION ENGINE
 # -----------------------------------------------------------------------------
 raw_df = load_combined_data(uploaded_fd, uploaded_espn, uploaded_vegas)
 
@@ -917,7 +956,7 @@ df_full["leverage"] = np.round(df_full["ceiling"] - df_full["proj_ownership"], 2
 df_active = df_full[df_full["blended_proj"] > 0].copy().reset_index(drop=True)
 
 # -----------------------------------------------------------------------------
-# 7. DASHBOARD TABS
+# 8. DASHBOARD TABS
 # -----------------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Player Pool & Metrics",
@@ -1332,7 +1371,6 @@ with tab3:
           })
 
         fd_csv_df = pd.DataFrame(fd_rows)
-        # FanDuel mass upload exact headers: QB, RB, RB, WR, WR, WR, TE, F LEX, D
         fd_csv_df.columns = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "F LEX", "D"]
 
         csv_data = fd_csv_df.to_csv(index=False)
