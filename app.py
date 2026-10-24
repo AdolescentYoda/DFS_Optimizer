@@ -831,6 +831,15 @@ if raw_df.empty:
   )
   st.stop()
 
+# --- EXCLUDE PLAYERS WIDGET & FILTER ---
+st.sidebar.markdown("---")
+st.sidebar.header("🚫 Exclude Players")
+all_player_names = sorted(raw_df["name"].unique().tolist()) if not raw_df.empty else []
+excluded_players = st.sidebar.multiselect("Select Players to Remove", all_player_names)
+
+if excluded_players:
+  raw_df = raw_df[~raw_df["name"].isin(excluded_players)].reset_index(drop=True)
+
 
 def apply_calibration_bias(row, blended_val):
   pos = standardize_position(row.get("position", ""))
