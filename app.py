@@ -761,8 +761,13 @@ uploaded_vegas = st.sidebar.file_uploader(
 st.sidebar.markdown("---")
 st.sidebar.header("⚡ Live API Controls")
 
+try:
+  api_key_default = st.secrets.get("ODDS_API_KEY", "")
+except Exception:
+  api_key_default = ""
+
 odds_api_key = st.sidebar.text_input(
-    "Odds API Key", value=st.secrets.get("ODDS_API_KEY", ""), type="password"
+    "Odds API Key", value=api_key_default, type="password"
 )
 
 if st.sidebar.button("🔄 Force Fresh API Pull"):
