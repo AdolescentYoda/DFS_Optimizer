@@ -815,8 +815,9 @@ st.sidebar.caption(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎲 Simulation Volatility")
+# Default set to 1.2 for optimized GPP ceiling capture
 global_risk_mult = st.sidebar.slider(
-    "Volatility Multiplier", 0.5, 2.0, 1.0, 0.1
+    "Volatility Multiplier", 0.5, 2.0, 1.2, 0.1
 )
 
 # -----------------------------------------------------------------------------
@@ -846,12 +847,12 @@ def apply_calibration_bias(row, blended_val):
   if blended_val <= 0:
     return 0.0
   multipliers = {
-      "QB": 1.015,
-      "RB": 1.030,
-      "WR": 1.030,
-      "TE": 1.020,
+      "QB": 1.030,
+      "RB": 1.010,
+      "WR": 1.035,
+      "TE": 1.025,
       "DEF": 1.000,
-      "FLEX": 1.025,
+      "FLEX": 1.030,
   }
   return blended_val * multipliers.get(pos, 1.02)
 
@@ -910,7 +911,7 @@ POSITION_BOOM_THRESHOLDS = {
 
 def compute_position_volatility_and_boom(row):
   pos = standardize_position(row.get("position", ""))
-  proj = row["blended_proj"]
+  proj = raw_df.loc[row.name, "blended_proj"] if hasattr(row, "name") else row["blended_proj"]
 
   vol_coeff = POSITION_VOLATILITY.get(pos, 0.45)
   std_dev = proj * vol_coeff * global_risk_mult
@@ -1162,16 +1163,17 @@ with tab3:
     st.stop()
 
   c1, c2, c3, c4, c5 = st.columns(5)
-  num_lineups = c1.number_input("Number of Lineups", 1, 50, 5)
+  # Defaults tailored for a 20-entry FanDuel GPP contest
+  num_lineups = c1.number_input("Number of Lineups", 1, 50, 20)
   max_stack = c2.number_input("Max Stack per Team", 2, 5, 4)
   randomness = (
-      c3.slider("Randomness / Noise (%)", 0.0, 20.0, 5.0, 1.0) / 100.0
+      c3.slider("Randomness / Noise (%)", 0.0, 20.0, 10.0, 1.0) / 100.0
   )
   max_exposure = (
-      c4.slider("Max Player Exposure (%)", 20.0, 100.0, 80.0, 10.0) / 100.0
+      c4.slider("Max Player Exposure (%)", 20.0, 100.0, 30.0, 10.0) / 100.0
   )
   gpp_blend_weight = (
-      c5.slider("GPP Simulation Blend (%)", 0.0, 100.0, 30.0, 5.0) / 100.0
+      c5.slider("GPP Simulation Blend (%)", 0.0, 100.0, 45.0, 5.0) / 100.0
   )
 
   if st.button("🚀 Optimize Lineups", type="primary"):
