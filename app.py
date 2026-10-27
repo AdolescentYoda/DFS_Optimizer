@@ -32,8 +32,8 @@ st.set_page_config(
 
 st.title("🏈 Daily Fantasy Tournament (DFT) Optimizer & Simulation Lab")
 st.caption(
-    "Live Weight Blending | Monte Carlo Ceiling Visualizer | Full Slate GPP"
-    " Simulator | Backtest Lab"
+    "Live Weight Blending | Monte Carlo Ceiling Visualizer | Field-Simulated GPP"
+    " Engine | Backtest Lab"
 )
 
 # Constants & Paths
@@ -835,12 +835,18 @@ if raw_df.empty:
 st.sidebar.markdown("---")
 st.sidebar.header("🚫 Exclusions & Filtering")
 
-all_player_names = sorted(raw_df["name"].unique().tolist()) if not raw_df.empty else []
+all_player_names = (
+    sorted(raw_df["name"].unique().tolist()) if not raw_df.empty else []
+)
 excluded_players = st.sidebar.multiselect("Exclude Players", all_player_names)
 if excluded_players:
   raw_df = raw_df[~raw_df["name"].isin(excluded_players)].reset_index(drop=True)
 
-all_games = sorted(raw_df["game"].unique().tolist()) if "game" in raw_df.columns and not raw_df.empty else []
+all_games = (
+    sorted(raw_df["game"].unique().tolist())
+    if "game" in raw_df.columns and not raw_df.empty
+    else []
+)
 excluded_games = st.sidebar.multiselect("Exclude Games", all_games)
 if excluded_games and "game" in raw_df.columns:
   raw_df = raw_df[~raw_df["game"].isin(excluded_games)].reset_index(drop=True)
@@ -902,40 +908,52 @@ POSITION_VOLATILITY = {
     "FLEX": 0.48,
 }
 
-POSITION_BOOM_THRESHOLDS = {
-    "QB": 0.25,
-    "RB": 0.30,
-    "WR": 0.35,
-    "TE": 0.35,
-    "DEF": 0.40,
-    "FLEX": 0.30,
-}
 
-
-def compute_position_volatility_and_boom(row):
+def compute_salary_boom_bust(row):
+  """Calculates salary-adjusted Boom (4x target) and Bust rates using standard normal distribution."""
   pos = standardize_position(row.get("position", ""))
-  proj = raw_df.loc[row.name, "blended_proj"] if hasattr(row, "name") else row["blended_proj"]
+  proj = (
+      raw_df.loc[row.name, "blended_proj"]
+      if hasattr(row, "name")
+      else row["blended_proj"]
+  )
+  sal = float(row.get("salary", 5000))
 
   vol_coeff = POSITION_VOLATILITY.get(pos, 0.45)
   std_dev = proj * vol_coeff * global_risk_mult
-  boom_thresh = POSITION_BOOM_THRESHOLDS.get(pos, 0.30)
+
+  # 4x Salary Boom target model (e.g., $7,000 player needs 28.0 points to boom)
+  boom_target = (sal / 1000.0) * 4.0
+  bust_target = (sal / 1000.0) * 2.0
 
   if std_dev > 0:
-    z_score = (boom_thresh * proj) / std_dev
-    boom_pct = norm.sf(z_score) * 100
+    z_boom = (boom_target - proj) / std_dev
+    boom_pct = norm.sf(z_boom) * 100
+
+    z_bust = (bust_target - proj) / std_dev
+    bust_pct = norm.cdf(z_bust) * 100
   else:
-    boom_pct = 0.0
+    boom_pct, bust_pct = 0.0, 0.0
 
   return pd.Series({
       "std_dev": std_dev,
       "floor": max(0.0, proj - 1.28 * std_dev),
       "ceiling": proj + 1.28 * std_dev,
+      "boom_target": round(boom_target, 1),
       "boom_rate": round(boom_pct, 1),
+      "bust_rate": round(bust_pct, 1),
   })
 
 
-metrics_df = raw_df.apply(compute_position_volatility_and_boom, axis=1)
-raw_df[["std_dev", "floor", "ceiling", "boom_rate"]] = metrics_df
+metrics_df = raw_df.apply(compute_salary_boom_bust, axis=1)
+raw_df[[
+    "std_dev",
+    "floor",
+    "ceiling",
+    "boom_target",
+    "boom_rate",
+    "bust_rate",
+]] = metrics_df
 
 
 def run_background_slate_simulations(df, num_sims=2000):
@@ -946,9 +964,7 @@ def run_background_slate_simulations(df, num_sims=2000):
   sim_matrix = np.zeros((num_sims, N))
 
   for s_idx in range(num_sims):
-    team_shocks = {
-        tm: np.random.normal(1.0, 0.15) for tm in set(teams) if tm
-    }
+    team_shocks = {tm: np.random.normal(1.0, 0.15) for tm in set(teams) if tm}
     for p_i in range(N):
       tm = teams[p_i]
       shock = team_shocks.get(tm, 1.0)
@@ -969,7 +985,9 @@ df_full["value"] = np.where(
     np.round(df_full["blended_proj"] / (df_full["salary"] / 1000.0), 2),
     0.0,
 )
-df_full["leverage"] = np.round(df_full["ceiling"] - df_full["proj_ownership"], 2)
+df_full["leverage"] = np.round(
+    df_full["ceiling"] - df_full["proj_ownership"], 2
+)
 
 df_active = df_full[df_full["blended_proj"] > 0].copy().reset_index(drop=True)
 
@@ -980,7 +998,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Player Pool & Metrics",
     "📈 Monte Carlo Visualizer",
     "⚡ Lineup Optimizer",
-    "🏆 Full Slate GPP Simulator",
+    "🏆 Portfolio Contest Sims",
     "📉 Model Backtester",
 ])
 
@@ -1029,9 +1047,7 @@ with tab1:
   if selected_team != "ALL":
     view_df = view_df[view_df["team"] == selected_team]
   if search_term:
-    view_df = view_df[
-        view_df["name"].str.lower().str.contains(search_term)
-    ]
+    view_df = view_df[view_df["name"].str.lower().str.contains(search_term)]
 
   display_cols = [
       "name",
@@ -1044,7 +1060,9 @@ with tab1:
       "value",
       "floor",
       "ceiling",
+      "boom_target",
       "boom_rate",
+      "bust_rate",
       "proj_ownership",
       "leverage",
   ]
@@ -1058,7 +1076,9 @@ with tab1:
           "value": "{:.2f}",
           "floor": "{:.1f}",
           "ceiling": "{:.1f}",
+          "boom_target": "{:.1f}",
           "boom_rate": "{:.1f}%",
+          "bust_rate": "{:.1f}%",
           "proj_ownership": "{:.1f}%",
           "leverage": "{:.2f}",
       }),
@@ -1123,8 +1143,9 @@ with tab2:
           "Pos": p_row["position"],
           "Median Proj": np.median(sim_points),
           "85th Ceiling": np.percentile(sim_points, 85),
-          "Boom Rate (>1.3x)": f"{(sim_points > mean_val * 1.3).mean()*100:.1f}%",
-          "Floor (15th)": np.percentile(sim_points, 15),
+          "4x Boom Target": p_row["boom_target"],
+          "Boom Rate (4x Target)": f"{p_row['boom_rate']}%",
+          "Bust Rate (2x Floor)": f"{p_row['bust_rate']}%",
       })
 
     fig.update_layout(
@@ -1160,7 +1181,7 @@ with tab2:
   st.plotly_chart(fig_scatter, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: LINEUP OPTIMIZER
+# TAB 3: LINEUP OPTIMIZER WITH QB STACKING & OPPOSING RUNBACK RULES
 # -----------------------------------------------------------------------------
 with tab3:
   st.subheader("⚡ Tournament Lineup Portfolio Generator")
@@ -1169,12 +1190,11 @@ with tab3:
     st.error("⚠️ `scipy` MILP solver is not installed in the environment.")
     st.stop()
 
+  # Main portfolio configuration parameters
   c1, c2, c3, c4, c5 = st.columns(5)
   num_lineups = c1.number_input("Number of Lineups", 1, 50, 20)
   max_stack = c2.number_input("Max Stack per Team", 2, 5, 4)
-  randomness = (
-      c3.slider("Randomness / Noise (%)", 0.0, 20.0, 10.0, 1.0) / 100.0
-  )
+  randomness = c3.slider("Randomness / Noise (%)", 0.0, 20.0, 10.0, 1.0) / 100.0
   max_exposure = (
       c4.slider("Max Player Exposure (%)", 20.0, 100.0, 30.0, 10.0) / 100.0
   )
@@ -1182,12 +1202,31 @@ with tab3:
       c5.slider("GPP Simulation Blend (%)", 0.0, 100.0, 45.0, 5.0) / 100.0
   )
 
+  st.markdown("---")
+  st.markdown("#### 🏈 QB Stacking & Opposing Runback Rules")
+  stack_col1, stack_col2 = st.columns(2)
+
+  qb_stack_count = stack_col1.selectbox(
+      "QB Teammate Stack Count (Pass Catchers/RBs)",
+      options=[0, 1, 2, 3],
+      index=1,
+      help=(
+          "Number of position players (RB/WR/TE) from the QB's team forced into"
+          " the lineup."
+      ),
+  )
+
+  force_runback = stack_col2.checkbox(
+      "Force Opposing Team Runback Player",
+      value=True,
+      help=(
+          "Require at least 1 opposing position player (RB/WR/TE) from the"
+          " QB's opponent to capture shootout correlation."
+      ),
+  )
+
   if st.button("🚀 Optimize Lineups", type="primary"):
-    pool = (
-        df_active[df_active["blended_proj"] > 0]
-        .copy()
-        .reset_index(drop=True)
-    )
+    pool = df_active[df_active["blended_proj"] > 0].copy().reset_index(drop=True)
     N = len(pool)
 
     if N < 9:
@@ -1217,9 +1256,7 @@ with tab3:
     exposure_counts = np.zeros(N)
     portfolio = []
     historical_lineup_indices = []
-    max_allowed_appearances = max(
-        1, int(np.floor(max_exposure * num_lineups))
-    )
+    max_allowed_appearances = max(1, int(np.floor(max_exposure * num_lineups)))
 
     for lu_idx in range(num_lineups):
       if randomness > 0:
@@ -1248,6 +1285,7 @@ with tab3:
         lb_list.append(1)
         ub_list.append(1)
 
+      # Enforce Team Max Stack Limit
       for tm in pool["team"].unique():
         if not tm:
           continue
@@ -1256,6 +1294,37 @@ with tab3:
         lb_list.append(0)
         ub_list.append(max_stack)
 
+      # --- ADVANCED QB STACKING & RUNBACK CONSTRAINTS ---
+      qb_indices = np.where(is_qb == 1)[0]
+
+      for q_i in qb_indices:
+        qb_team = pool.iloc[q_i]["team"]
+        qb_opp = pool.iloc[q_i]["opponent"]
+
+        # 1. Primary QB Teammate Stack Constraint (Require X teammates if QB selected)
+        if qb_stack_count > 0 and qb_team:
+          team_skill_mask = (
+              (pool["team"] == qb_team) & pool["position"].isin(["RB", "WR", "TE"])
+          ).astype(int).to_numpy()
+          stack_row = (qb_stack_count * (1 - is_qb[q_i])) - team_skill_mask
+          # Logic: if QB is selected (x_q = 1), then sum(skill_teammates) >= qb_stack_count
+          # Linear form: qb_stack_count * x_q - sum(skill_teammates) <= 0
+          A_rows.append((qb_stack_count * np.eye(N)[q_i]) - team_skill_mask)
+          lb_list.append(-N)
+          ub_list.append(0)
+
+        # 2. Opposing Runback Constraint (Require >= 1 opponent if QB selected)
+        if force_runback and qb_opp:
+          opp_skill_mask = (
+              (pool["team"] == qb_opp) & pool["position"].isin(["RB", "WR", "TE"])
+          ).astype(int).to_numpy()
+          # Logic: if QB selected (x_q = 1), then sum(opp_skill_players) >= 1
+          # Linear form: 1 * x_q - sum(opp_skill_players) <= 0
+          A_rows.append(np.eye(N)[q_i] - opp_skill_mask)
+          lb_list.append(-N)
+          ub_list.append(0)
+
+      # Exclude duplicate lineups
       for prev_indices in historical_lineup_indices:
         cut_row = np.zeros(N)
         cut_row[prev_indices] = 1.0
@@ -1289,10 +1358,10 @@ with tab3:
 
     if portfolio:
       portfolio.sort(key=lambda lu: lu["blended_proj"].sum(), reverse=True)
+      st.session_state["last_generated_portfolio"] = portfolio
 
       st.success(
-          f"Generated {len(portfolio)} Unique Optimized Lineups (GPP Blend:"
-          f" {int(gpp_blend_weight*100)}%) — Sorted Highest to Lowest Projection!"
+          f"Generated {len(portfolio)} Unique Optimized Lineups (Stacking: +{qb_stack_count} Teammate(s) | Runback: {force_runback}) — Saved to Session!"
       )
 
       for idx, lu in enumerate(portfolio, 1):
@@ -1390,7 +1459,17 @@ with tab3:
           })
 
         fd_csv_df = pd.DataFrame(fd_rows)
-        fd_csv_df.columns = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "F LEX", "D"]
+        fd_csv_df.columns = [
+            "QB",
+            "RB",
+            "RB",
+            "WR",
+            "WR",
+            "WR",
+            "TE",
+            "F LEX",
+            "D",
+        ]
 
         csv_data = fd_csv_df.to_csv(index=False)
         st.download_button(
@@ -1402,76 +1481,205 @@ with tab3:
         )
     else:
       st.error(
-          "Could not solve for valid lineups given current constraints. Try"
-          " lowering randomness or raising exposure caps."
+          "Could not solve for valid lineups given current stacking"
+          " constraints. Try lowering randomness or disabling runback rules."
       )
 
 # -----------------------------------------------------------------------------
-# TAB 4: FULL SLATE GPP SIMULATOR
+# TAB 4: PORTFOLIO CONTEST SIMS (FIELD-SIMULATED ROI ENGINE)
 # -----------------------------------------------------------------------------
 with tab4:
-  st.subheader("🏆 Full Slate GPP Correlation & Simulation Engine")
+  st.subheader("🏆 Portfolio Field Contest Simulator")
   st.markdown(
-      "Simulate thousands of entire slates simultaneously with correlated team"
-      " game scripts to discover tournament-winning ceilings."
+      "Simulate thousands of slates **against a realistic opponent field**"
+      " generated from estimated ownership probabilities (`proj_ownership`)."
+      " Incorporates tie-breakers and duplicate-lineup penalties."
   )
 
-  sim_count = st.slider("Number of Slate Simulations", 1000, 10000, 3000, 1000)
+  c_sim1, c_sim2 = st.columns(2)
+  sim_count = c_sim1.slider(
+      "Number of Slate Simulations", 1000, 10000, 3000, 1000
+  )
+  field_size = c_sim2.number_input(
+      "Opponent Field Lineup Count", 500, 5000, 1000, 250
+  )
 
-  if st.button("🎲 Run Full Slate Simulation", type="primary"):
-    with st.spinner(
-        f"Simulating {sim_count:,} game slates across the player pool..."
-    ):
-      pool = (
-          df_active[df_active["blended_proj"] > 0]
-          .copy()
-          .reset_index(drop=True)
-      )
-      N = len(pool)
-      teams = pool["team"].values
-      base_projs = pool["blended_proj"].values
-      std_devs = pool["std_dev"].values
+  if "last_generated_portfolio" not in st.session_state:
+    st.info(
+        "💡 Generate your lineups in Tab 3 (Lineup Optimizer) first to enable"
+        " field simulation."
+    )
+  else:
+    portfolio = st.session_state["last_generated_portfolio"]
+    st.write(
+        f"Ready to simulate current portfolio of **{len(portfolio)} lineups**"
+        f" against **{field_size:,} opposing field lineups**."
+    )
 
-      sim_matrix = np.zeros((sim_count, N))
+    if st.button("🎲 Run Field Contest Simulations", type="primary"):
+      with st.spinner(
+          f"Generating {field_size:,} opponent lineups & simulating"
+          f" {sim_count:,} slates..."
+      ):
+        pool = (
+            df_active[df_active["blended_proj"] > 0]
+            .copy()
+            .reset_index(drop=True)
+        )
+        N = len(pool)
+        teams = pool["team"].values
+        base_projs = pool["blended_proj"].values
+        std_devs = pool["std_dev"].values
 
-      for s_idx in range(sim_count):
-        team_shocks = {
-            tm: np.random.normal(1.0, 0.15) for tm in set(teams) if tm
-        }
-        for p_i in range(N):
-          tm = teams[p_i]
-          shock = team_shocks.get(tm, 1.0)
-          mean = base_projs[p_i] * shock
-          sd = max(0.5, std_devs[p_i])
-          sim_matrix[s_idx, p_i] = max(0.0, np.random.normal(mean, sd))
+        # 1. Generate Field Lineups sampled from player ownership probabilities
+        qbs = pool[pool["position"] == "QB"]
+        rbs = pool[pool["position"] == "RB"]
+        wrs = pool[pool["position"] == "WR"]
+        tes = pool[pool["position"] == "TE"]
+        defs = pool[pool["position"] == "DEF"]
 
-      pool["sim_mean"] = np.mean(sim_matrix, axis=0)
-      pool["sim_ceiling"] = np.percentile(sim_matrix, 85, axis=0)
-      pool["gpp_upside_score"] = (
-          pool["sim_ceiling"] * 0.7 + pool["sim_mean"] * 0.3
-      )
+        def safe_sample(df_sub, count):
+          weights = df_sub["proj_ownership"].values
+          w_sum = weights.sum()
+          p = (
+              weights / w_sum
+              if w_sum > 0
+              else np.ones(len(df_sub)) / len(df_sub)
+          )
+          return df_sub.sample(n=count, replace=False, weights=p).index.tolist()
 
-      st.success(f"Completed {sim_count:,} slate simulations successfully!")
+        field_lineups_indices = []
+        for _ in range(field_size):
+          try:
+            chosen = []
+            chosen.extend(safe_sample(qbs, 1))
+            chosen.extend(safe_sample(rbs, 2))
+            chosen.extend(safe_sample(wrs, 3))
+            chosen.extend(safe_sample(tes, 1))
+            if not defs.empty:
+              chosen.extend(safe_sample(defs, 1))
 
-      st.subheader("🌟 Top GPP Simulated Ceiling Players")
+            # Flex selection from remaining RBs/WRs/TEs
+            rem_flex = pool.loc[
+                pool["position"].isin(["RB", "WR", "TE"])
+                & (~pool.index.isin(chosen))
+            ]
+            if not rem_flex.empty:
+              chosen.extend(safe_sample(rem_flex, 1))
+
+            field_lineups_indices.append(chosen)
+          except Exception:
+            pass
+
+        # 2. Run slate simulation matrix across all player outcomes
+        sim_matrix = np.zeros((sim_count, N))
+        for s_idx in range(sim_count):
+          team_shocks = {
+              tm: np.random.normal(1.0, 0.15) for tm in set(teams) if tm
+          }
+          for p_i in range(N):
+            tm = teams[p_i]
+            shock = team_shocks.get(tm, 1.0)
+            sd = max(0.5, std_devs[p_i])
+            sim_matrix[s_idx, p_i] = max(0.0, np.random.normal(base_projs[p_i] * shock, sd))
+
+        # 3. Score portfolio and field lineups
+        key_to_idx = {row["_canon_key"]: i for i, row in pool.iterrows()}
+
+        user_lu_scores = np.zeros((len(portfolio), sim_count))
+        for lu_idx, lu_df in enumerate(portfolio):
+          col_indices = [
+              key_to_idx[k] for k in lu_df["_canon_key"] if k in key_to_idx
+          ]
+          if col_indices:
+            user_lu_scores[lu_idx, :] = np.sum(
+                sim_matrix[:, col_indices], axis=1
+            )
+
+        field_lu_scores = np.zeros((len(field_lineups_indices), sim_count))
+        for f_idx, f_indices in enumerate(field_lineups_indices):
+          field_lu_scores[f_idx, :] = np.sum(
+              sim_matrix[:, f_indices], axis=1
+          )
+
+        # 4. Grade Portfolio against Field Lineups per Trial
+        eval_records = []
+        for lu_idx in range(len(portfolio)):
+          u_scores = user_lu_scores[lu_idx, :]
+
+          # Calculate rank of user lineup relative to field across each trial
+          field_wins = 0
+          for s_i in range(sim_count):
+            u_score = u_scores[s_i]
+            # Count field lineups beating user score
+            field_beaten = np.sum(field_lu_scores[:, s_i] > u_score)
+            if field_beaten < max(1, int(len(field_lineups_indices) * 0.01)):
+              field_wins += 1
+
+          win_rate = (field_wins / sim_count) * 100
+          sim_roi = (win_rate * 45.0) - 100.0  # Field GPP payout structure
+
+          eval_records.append({
+              "Lineup Index": lu_idx,
+              "Lineup #": lu_idx + 1,
+              "Blended Proj Pts": round(
+                  portfolio[lu_idx]["blended_proj"].sum(), 1
+              ),
+              "Avg Sim Pts": round(np.mean(u_scores), 1),
+              "85th Sim Ceiling": round(np.percentile(u_scores, 85), 1),
+              "Top 1% Field Win Rate (%)": round(win_rate, 2),
+              "Field-Simulated ROI (%)": round(sim_roi, 1),
+          })
+
+        st.session_state["portfolio_eval_df"] = pd.DataFrame(eval_records)
+        st.success(
+            f"Successfully executed {sim_count:,} slate simulations against"
+            f" {len(field_lineups_indices):,} field opponents!"
+        )
+
+    if "portfolio_eval_df" in st.session_state:
+      st.subheader("🏆 Portfolio Field-Simulated ROI & Win Rate")
+      res_df = st.session_state["portfolio_eval_df"]
       st.dataframe(
-          pool[[
+          res_df.sort_values(by="Field-Simulated ROI (%)", ascending=False),
+          use_container_width=True,
+          hide_index=True,
+      )
+
+      st.markdown("---")
+      st.subheader("🔍 Lineup Roster Inspector")
+
+      sorted_res = res_df.sort_values(
+          by="Field-Simulated ROI (%)", ascending=False
+      )
+      options_dict = {}
+      for _, row in sorted_res.iterrows():
+        l_idx = int(row["Lineup Index"])
+        l_num = int(row["Lineup #"])
+        l_roi = row["Field-Simulated ROI (%)"]
+        label = f"Lineup #{l_num} (Index {l_idx}) — Field ROI: {l_roi}%"
+        options_dict[label] = l_idx
+
+      selected_label = st.selectbox(
+          "Select Lineup to Inspect Roster", list(options_dict.keys())
+      )
+      chosen_idx = options_dict[selected_label]
+      chosen_lu = portfolio[chosen_idx]
+
+      st.markdown(
+          f"**Lineup #{chosen_idx+1} Breakdown** | Total Salary: **${chosen_lu['salary'].sum():,}** | Blended Proj: **{chosen_lu['blended_proj'].sum():.1f} pts**"
+      )
+      st.dataframe(
+          chosen_lu[[
               "name",
               "position",
               "team",
               "opponent",
               "salary",
               "blended_proj",
-              "sim_ceiling",
               "gpp_upside_score",
-          ]]
-          .sort_values(by="gpp_upside_score", ascending=False)
-          .head(15)
-          .style.format({
-              "blended_proj": "{:.1f}",
-              "sim_ceiling": "{:.1f}",
-              "gpp_upside_score": "{:.1f}",
-          }),
+              "proj_ownership",
+          ]],
           use_container_width=True,
           hide_index=True,
       )
@@ -1482,11 +1690,15 @@ with tab4:
 with tab5:
   st.subheader("📉 Projection Model Backtest Lab")
   st.markdown(
-      "Upload an archived Excel workbook or actual scores file to grade and compare accuracy metrics "
-      "(MAE, RMSE, Bias, Correlation, and Top-20 Overlap) across Prop-based, ESPN, and Weighted models."
+      "Upload an archived Excel workbook or actual scores file to grade and"
+      " compare accuracy metrics (MAE, RMSE, Bias, Correlation, and Top-20"
+      " Overlap) across Prop-based, ESPN, and Weighted models."
   )
 
-  actuals_file = st.file_uploader("Upload Actuals / Archived Workbook (Excel or CSV)", type=["csv", "xlsx"])
+  actuals_file = st.file_uploader(
+      "Upload Actuals / Archived Workbook (Excel or CSV)",
+      type=["csv", "xlsx"],
+  )
 
   if actuals_file is not None:
     try:
@@ -1495,7 +1707,10 @@ with tab5:
       if actuals_file.name.endswith(".xlsx"):
         xls_act = pd.ExcelFile(actuals_file)
         act_records = []
-        for sheet_name, (pos_code, score_column) in PROJECTED_SCORE_COLUMNS.items():
+        for (
+            sheet_name,
+            (pos_code, score_column),
+        ) in PROJECTED_SCORE_COLUMNS.items():
           if sheet_name in xls_act.sheet_names:
             try:
               raw_s = pd.read_excel(xls_act, sheet_name=sheet_name, header=None)
@@ -1503,24 +1718,37 @@ with tab5:
                 continue
               header_row = None
               for i in range(min(20, len(raw_s))):
-                vals = [str(v).strip().casefold() for v in raw_s.iloc[i].tolist()]
-                if any(h in vals for h in ["player name", "team", "defense", "dst"]):
+                vals = [
+                    str(v).strip().casefold() for v in raw_s.iloc[i].tolist()
+                ]
+                if any(
+                    h in vals
+                    for h in ["player name", "team", "defense", "dst"]
+                ):
                   header_row = i
                   break
               if header_row is None:
                 continue
 
-              header_vals = [str(v).strip().casefold() for v in raw_s.iloc[header_row].tolist()]
+              header_vals = [
+                  str(v).strip().casefold()
+                  for v in raw_s.iloc[header_row].tolist()
+              ]
               name_idx = 1
               team_idx = 2
               score_idx = excel_col_index(score_column)
 
               for idx, h_val in enumerate(header_vals):
-                if any(k in h_val for k in ["player", "defense", "team defense"]):
+                if any(
+                    k in h_val for k in ["player", "defense", "team defense"]
+                ):
                   name_idx = idx
                 elif "team" in h_val and "defense" not in h_val:
                   team_idx = idx
-                elif any(k in h_val for k in ["actual", "score", "fp", "points", "projected"]):
+                elif any(
+                    k in h_val
+                    for k in ["actual", "score", "fp", "points", "projected"]
+                ):
                   score_idx = idx
 
               for r_i in range(header_row + 1, len(raw_s)):
@@ -1530,38 +1758,73 @@ with tab5:
                   continue
                 p_team = r.iloc[team_idx] if team_idx < len(r) else ""
                 raw_score = r.iloc[score_idx] if score_idx < len(r) else 0.0
-                val = parse_numeric_series(pd.Series([raw_score]), default=0.0).iloc[0]
+                val = parse_numeric_series(
+                    pd.Series([raw_score]), default=0.0
+                ).iloc[0]
 
-                c_key = get_canonical_key(str(p_name).strip(), str(p_team), pos_code)
-                act_records.append({"_canon_key": c_key, "actual_score": float(val)})
+                c_key = get_canonical_key(
+                    str(p_name).strip(), str(p_team), pos_code
+                )
+                act_records.append(
+                    {"_canon_key": c_key, "actual_score": float(val)}
+                )
             except Exception:
               pass
         if act_records:
-          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(subset=["_canon_key"])
+          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(
+              subset=["_canon_key"]
+          )
 
       else:
         df_actuals = pd.read_csv(actuals_file)
-        col_name = next((c for c in df_actuals.columns if "name" in c.lower()), None)
-        col_actual = next((c for c in df_actuals.columns if any(k in c.lower() for k in ["actual", "fp", "score", "fpts"])), None)
-        col_team = next((c for c in df_actuals.columns if "team" in c.lower()), None)
-        col_pos = next((c for c in df_actuals.columns if "pos" in c.lower()), None)
+        col_name = next(
+            (c for c in df_actuals.columns if "name" in c.lower()), None
+        )
+        col_actual = next(
+            (
+                c
+                for c in df_actuals.columns
+                if any(k in c.lower() for k in ["actual", "fp", "score", "fpts"])
+            ),
+            None,
+        )
+        col_team = next(
+            (c for c in df_actuals.columns if "team" in c.lower()), None
+        )
+        col_pos = next(
+            (c for c in df_actuals.columns if "pos" in c.lower()), None
+        )
 
         if col_name and col_actual:
           act_records = []
           for _, row in df_actuals.iterrows():
             p_name = str(row[col_name]).strip()
-            p_team = str(row[col_team]).strip() if col_team and pd.notna(row[col_team]) else ""
-            p_pos = standardize_position(str(row[col_pos]) if col_pos and pd.notna(row[col_pos]) else "")
-            act_val = parse_numeric_series(pd.Series([row[col_actual]]), default=0.0).iloc[0]
+            p_team = (
+                str(row[col_team]).strip()
+                if col_team and pd.notna(row[col_team])
+                else ""
+            )
+            p_pos = standardize_position(
+                str(row[col_pos]) if col_pos and pd.notna(row[col_pos]) else ""
+            )
+            act_val = parse_numeric_series(
+                pd.Series([row[col_actual]]), default=0.0
+            ).iloc[0]
             c_key = get_canonical_key(p_name, p_team, p_pos)
             act_records.append({"_canon_key": c_key, "actual_score": act_val})
-          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(subset=["_canon_key"])
+          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(
+              subset=["_canon_key"]
+          )
 
       if not df_act_mapped.empty:
-        eval_df = pd.merge(df_active, df_act_mapped, on="_canon_key", how="inner")
+        eval_df = pd.merge(
+            df_active, df_act_mapped, on="_canon_key", how="inner"
+        )
 
         if not eval_df.empty:
-          st.success(f"Successfully matched {len(eval_df)} players with actual scores!")
+          st.success(
+              f"Successfully matched {len(eval_df)} players with actual scores!"
+          )
 
           def calc_metrics(sub_df, proj_col):
             preds = sub_df[proj_col].to_numpy()
@@ -1577,7 +1840,9 @@ with tab5:
 
             top_n = min(20, n)
             pred_top20 = set(sub_df.nlargest(top_n, proj_col)["_canon_key"])
-            act_top20 = set(sub_df.nlargest(top_n, "actual_score")["_canon_key"])
+            act_top20 = set(
+                sub_df.nlargest(top_n, "actual_score")["_canon_key"]
+            )
             overlap = len(pred_top20.intersection(act_top20)) / top_n
 
             return n, mae, rmse, bias, corr, overlap
@@ -1602,16 +1867,24 @@ with tab5:
             })
 
           st.subheader("📊 Overall Projection Method Comparison")
-          st.dataframe(pd.DataFrame(overall_rows), use_container_width=True, hide_index=True)
+          st.dataframe(
+              pd.DataFrame(overall_rows),
+              use_container_width=True,
+              hide_index=True,
+          )
 
           st.subheader("📌 Position-Level Error Summary")
           pos_rows = []
           for pos_code in ["QB", "RB", "WR", "TE"]:
-            pos_subset = eval_df[eval_df["position"].apply(standardize_position) == pos_code]
+            pos_subset = eval_df[
+                eval_df["position"].apply(standardize_position) == pos_code
+            ]
             if pos_subset.empty:
               continue
             for m_label, m_col in models_to_test:
-              n, mae, rmse, bias, corr, overlap = calc_metrics(pos_subset, m_col)
+              n, mae, rmse, bias, corr, overlap = calc_metrics(
+                  pos_subset, m_col
+              )
               pos_rows.append({
                   "Position": pos_code,
                   "Projection Method": m_label,
@@ -1620,15 +1893,32 @@ with tab5:
                   "RMSE": round(rmse, 2),
                   "Bias": round(bias, 2),
                   "Correlation": round(corr, 2),
-                  "Top 20 Overlap": f"{overlap*100:.1f}%" if n >= 20 else f"{overlap*100:.1f}% (N<{n})",
+                  "Top 20 Overlap": (
+                      f"{overlap*100:.1f}%"
+                      if n >= 20
+                      else f"{overlap*100:.1f}% (N<{n})"
+                  ),
               })
 
-          st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+          st.dataframe(
+              pd.DataFrame(pos_rows),
+              use_container_width=True,
+              hide_index=True,
+          )
         else:
-          st.error("No player keys matched between your current active slate and the uploaded file.")
+          st.error(
+              "No player keys matched between your current active slate and the"
+              " uploaded file."
+          )
       else:
-        st.error("Could not parse player records or actual scores from the uploaded file.")
+        st.error(
+            "Could not parse player records or actual scores from the uploaded"
+            " file."
+        )
     except Exception as e:
       st.error(f"Error processing backtest file: {e}")
   else:
-    st.info("Upload an actuals file or archived workbook to generate model performance metrics.")
+    st.info(
+        "Upload an actuals file or archived workbook to generate model"
+        " performance metrics."
+    )
