@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.stats import gaussian_kde, norm
+from scipy.stats import gaussian_kde, norm, pearsonr
 import streamlit as st
 
 try:
@@ -33,7 +33,7 @@ st.set_page_config(
 st.title("🏈 Daily Fantasy Tournament (DFT) Optimizer & Simulation Lab")
 st.caption(
     "Live Weight Blending | Monte Carlo Ceiling Visualizer | Full Slate GPP"
-    " Simulator"
+    " Simulator | Backtest Lab"
 )
 
 # Constants & Paths
@@ -815,7 +815,6 @@ st.sidebar.caption(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎲 Simulation Volatility")
-# Default set to 1.2 for optimized GPP ceiling capture
 global_risk_mult = st.sidebar.slider(
     "Volatility Multiplier", 0.5, 2.0, 1.2, 0.1
 )
@@ -832,14 +831,19 @@ if raw_df.empty:
   )
   st.stop()
 
-# --- EXCLUDE PLAYERS WIDGET & FILTER ---
+# --- EXCLUSION FILTERS (Players & Games) ---
 st.sidebar.markdown("---")
-st.sidebar.header("🚫 Exclude Players")
-all_player_names = sorted(raw_df["name"].unique().tolist()) if not raw_df.empty else []
-excluded_players = st.sidebar.multiselect("Select Players to Remove", all_player_names)
+st.sidebar.header("🚫 Exclusions & Filtering")
 
+all_player_names = sorted(raw_df["name"].unique().tolist()) if not raw_df.empty else []
+excluded_players = st.sidebar.multiselect("Exclude Players", all_player_names)
 if excluded_players:
   raw_df = raw_df[~raw_df["name"].isin(excluded_players)].reset_index(drop=True)
+
+all_games = sorted(raw_df["game"].unique().tolist()) if "game" in raw_df.columns and not raw_df.empty else []
+excluded_games = st.sidebar.multiselect("Exclude Games", all_games)
+if excluded_games and "game" in raw_df.columns:
+  raw_df = raw_df[~raw_df["game"].isin(excluded_games)].reset_index(drop=True)
 
 
 def apply_calibration_bias(row, blended_val):
@@ -866,7 +870,6 @@ def compute_blended_proj(row, w_v, w_e):
   e = row["espn_proj"]
   salary = row.get("salary", 5000)
 
-  # Dynamic weighting: For elite/high-salary players, lean more into ESPN for ceiling upside
   if salary >= 7500 and pos_std in ["QB", "RB", "WR"]:
     effective_v_weight = 0.45
     effective_e_weight = 0.55
@@ -973,11 +976,12 @@ df_active = df_full[df_full["blended_proj"] > 0].copy().reset_index(drop=True)
 # -----------------------------------------------------------------------------
 # 8. DASHBOARD TABS
 # -----------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Player Pool & Metrics",
     "📈 Monte Carlo Visualizer",
     "⚡ Lineup Optimizer",
     "🏆 Full Slate GPP Simulator",
+    "📉 Model Backtester",
 ])
 
 # -----------------------------------------------------------------------------
@@ -1008,8 +1012,8 @@ with tab1:
   st.markdown("---")
 
   f_col1, f_col2, f_col3 = st.columns([1, 1, 2])
-  positions = ["ALL"] + sorted(df_active["position"].unique().tolist())
-  selected_pos = f_col1.selectbox("Filter Position", positions)
+  position_options = ["ALL", "FLEX", "QB", "RB", "WR", "TE", "DEF"]
+  selected_pos = f_col1.selectbox("Filter Position", position_options)
 
   teams = ["ALL"] + sorted(df_active["team"].unique().tolist())
   selected_team = f_col2.selectbox("Filter Team", teams)
@@ -1017,8 +1021,11 @@ with tab1:
   search_term = f_col3.text_input("Search Player Name", "").strip().lower()
 
   view_df = df_active.copy()
-  if selected_pos != "ALL":
+  if selected_pos == "FLEX":
+    view_df = view_df[view_df["position"].isin(["RB", "WR", "TE"])]
+  elif selected_pos != "ALL":
     view_df = view_df[view_df["position"] == selected_pos]
+
   if selected_team != "ALL":
     view_df = view_df[view_df["team"] == selected_team]
   if search_term:
@@ -1163,7 +1170,6 @@ with tab3:
     st.stop()
 
   c1, c2, c3, c4, c5 = st.columns(5)
-  # Defaults tailored for a 20-entry FanDuel GPP contest
   num_lineups = c1.number_input("Number of Lineups", 1, 50, 20)
   max_stack = c2.number_input("Max Stack per Team", 2, 5, 4)
   randomness = (
@@ -1250,7 +1256,6 @@ with tab3:
         lb_list.append(0)
         ub_list.append(max_stack)
 
-      # Dynamic Integer Cuts (No-Good Cuts) to eliminate exact duplicate lineups
       for prev_indices in historical_lineup_indices:
         cut_row = np.zeros(N)
         cut_row[prev_indices] = 1.0
@@ -1283,7 +1288,6 @@ with tab3:
         break
 
     if portfolio:
-      # SORT LINEUPS DESCENDING BY TOTAL BLENDED PROJECTION
       portfolio.sort(key=lambda lu: lu["blended_proj"].sum(), reverse=True)
 
       st.success(
@@ -1343,7 +1347,6 @@ with tab3:
             hide_index=True,
         )
 
-      # --- FANDUEL MASS UPLOAD CSV GENERATOR (USING PLAYER IDs) ---
       with col_dl:
         st.markdown("#### 📥 Mass Upload CSV (ID-based)")
         fd_rows = []
@@ -1472,3 +1475,160 @@ with tab4:
           use_container_width=True,
           hide_index=True,
       )
+
+# -----------------------------------------------------------------------------
+# TAB 5: MODEL BACKTESTER
+# -----------------------------------------------------------------------------
+with tab5:
+  st.subheader("📉 Projection Model Backtest Lab")
+  st.markdown(
+      "Upload an archived Excel workbook or actual scores file to grade and compare accuracy metrics "
+      "(MAE, RMSE, Bias, Correlation, and Top-20 Overlap) across Prop-based, ESPN, and Weighted models."
+  )
+
+  actuals_file = st.file_uploader("Upload Actuals / Archived Workbook (Excel or CSV)", type=["csv", "xlsx"])
+
+  if actuals_file is not None:
+    try:
+      df_act_mapped = pd.DataFrame()
+
+      if actuals_file.name.endswith(".xlsx"):
+        xls_act = pd.ExcelFile(actuals_file)
+        act_records = []
+        for sheet_name, (pos_code, score_column) in PROJECTED_SCORE_COLUMNS.items():
+          if sheet_name in xls_act.sheet_names:
+            try:
+              raw_s = pd.read_excel(xls_act, sheet_name=sheet_name, header=None)
+              if raw_s.empty:
+                continue
+              header_row = None
+              for i in range(min(20, len(raw_s))):
+                vals = [str(v).strip().casefold() for v in raw_s.iloc[i].tolist()]
+                if any(h in vals for h in ["player name", "team", "defense", "dst"]):
+                  header_row = i
+                  break
+              if header_row is None:
+                continue
+
+              header_vals = [str(v).strip().casefold() for v in raw_s.iloc[header_row].tolist()]
+              name_idx = 1
+              team_idx = 2
+              score_idx = excel_col_index(score_column)
+
+              for idx, h_val in enumerate(header_vals):
+                if any(k in h_val for k in ["player", "defense", "team defense"]):
+                  name_idx = idx
+                elif "team" in h_val and "defense" not in h_val:
+                  team_idx = idx
+                elif any(k in h_val for k in ["actual", "score", "fp", "points", "projected"]):
+                  score_idx = idx
+
+              for r_i in range(header_row + 1, len(raw_s)):
+                r = raw_s.iloc[r_i]
+                p_name = r.iloc[name_idx] if name_idx < len(r) else None
+                if pd.isna(p_name) or str(p_name).strip() == "":
+                  continue
+                p_team = r.iloc[team_idx] if team_idx < len(r) else ""
+                raw_score = r.iloc[score_idx] if score_idx < len(r) else 0.0
+                val = parse_numeric_series(pd.Series([raw_score]), default=0.0).iloc[0]
+
+                c_key = get_canonical_key(str(p_name).strip(), str(p_team), pos_code)
+                act_records.append({"_canon_key": c_key, "actual_score": float(val)})
+            except Exception:
+              pass
+        if act_records:
+          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(subset=["_canon_key"])
+
+      else:
+        df_actuals = pd.read_csv(actuals_file)
+        col_name = next((c for c in df_actuals.columns if "name" in c.lower()), None)
+        col_actual = next((c for c in df_actuals.columns if any(k in c.lower() for k in ["actual", "fp", "score", "fpts"])), None)
+        col_team = next((c for c in df_actuals.columns if "team" in c.lower()), None)
+        col_pos = next((c for c in df_actuals.columns if "pos" in c.lower()), None)
+
+        if col_name and col_actual:
+          act_records = []
+          for _, row in df_actuals.iterrows():
+            p_name = str(row[col_name]).strip()
+            p_team = str(row[col_team]).strip() if col_team and pd.notna(row[col_team]) else ""
+            p_pos = standardize_position(str(row[col_pos]) if col_pos and pd.notna(row[col_pos]) else "")
+            act_val = parse_numeric_series(pd.Series([row[col_actual]]), default=0.0).iloc[0]
+            c_key = get_canonical_key(p_name, p_team, p_pos)
+            act_records.append({"_canon_key": c_key, "actual_score": act_val})
+          df_act_mapped = pd.DataFrame(act_records).drop_duplicates(subset=["_canon_key"])
+
+      if not df_act_mapped.empty:
+        eval_df = pd.merge(df_active, df_act_mapped, on="_canon_key", how="inner")
+
+        if not eval_df.empty:
+          st.success(f"Successfully matched {len(eval_df)} players with actual scores!")
+
+          def calc_metrics(sub_df, proj_col):
+            preds = sub_df[proj_col].to_numpy()
+            acts = sub_df["actual_score"].to_numpy()
+            n = len(sub_df)
+            if n == 0:
+              return 0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+            mae = np.mean(np.abs(preds - acts))
+            rmse = np.sqrt(np.mean((preds - acts) ** 2))
+            bias = np.mean(preds - acts)
+            corr, _ = pearsonr(preds, acts) if n > 1 else (0.0, 0.0)
+
+            top_n = min(20, n)
+            pred_top20 = set(sub_df.nlargest(top_n, proj_col)["_canon_key"])
+            act_top20 = set(sub_df.nlargest(top_n, "actual_score")["_canon_key"])
+            overlap = len(pred_top20.intersection(act_top20)) / top_n
+
+            return n, mae, rmse, bias, corr, overlap
+
+          models_to_test = [
+              ("Prop-based model", "vegas_proj"),
+              ("ESPN", "espn_proj"),
+              ("Weighted", "blended_proj"),
+          ]
+
+          overall_rows = []
+          for m_label, m_col in models_to_test:
+            n, mae, rmse, bias, corr, overlap = calc_metrics(eval_df, m_col)
+            overall_rows.append({
+                "Projection": m_label,
+                "Scored Players": n,
+                "MAE": round(mae, 4),
+                "RMSE": round(rmse, 4),
+                "Bias": round(bias, 4),
+                "Correlation with Actual": round(corr, 4),
+                "Top-20 Overlap": round(overlap, 2),
+            })
+
+          st.subheader("📊 Overall Projection Method Comparison")
+          st.dataframe(pd.DataFrame(overall_rows), use_container_width=True, hide_index=True)
+
+          st.subheader("📌 Position-Level Error Summary")
+          pos_rows = []
+          for pos_code in ["QB", "RB", "WR", "TE"]:
+            pos_subset = eval_df[eval_df["position"].apply(standardize_position) == pos_code]
+            if pos_subset.empty:
+              continue
+            for m_label, m_col in models_to_test:
+              n, mae, rmse, bias, corr, overlap = calc_metrics(pos_subset, m_col)
+              pos_rows.append({
+                  "Position": pos_code,
+                  "Projection Method": m_label,
+                  "N": n,
+                  "MAE": round(mae, 2),
+                  "RMSE": round(rmse, 2),
+                  "Bias": round(bias, 2),
+                  "Correlation": round(corr, 2),
+                  "Top 20 Overlap": f"{overlap*100:.1f}%" if n >= 20 else f"{overlap*100:.1f}% (N<{n})",
+              })
+
+          st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+        else:
+          st.error("No player keys matched between your current active slate and the uploaded file.")
+      else:
+        st.error("Could not parse player records or actual scores from the uploaded file.")
+    except Exception as e:
+      st.error(f"Error processing backtest file: {e}")
+  else:
+    st.info("Upload an actuals file or archived workbook to generate model performance metrics.")
