@@ -1,5 +1,6 @@
 import csv
 import datetime
+import difflib
 from io import BytesIO, StringIO
 import json
 import os
@@ -171,7 +172,7 @@ def calculate_fd_expected_points(
 
 
 # -----------------------------------------------------------------------------
-# 3. LIVE ODDS API (24H CLOCK CACHED & STICKY MERGE ROTATION)
+# 3. LIVE ODDS API (CACHED, CREDIT-PROTECTED & EXPORT/IMPORT CAPABLE)
 # -----------------------------------------------------------------------------
 def check_cache_status(filepath):
   """Checks if local odds cache exists and evaluates age against 24-hr clock."""
@@ -190,26 +191,147 @@ def load_odds_cache_data(filepath):
   """Loads cached odds file from disk to protect API credits."""
   if os.path.exists(filepath):
     try:
-      with open(filepath, "r") as f:
+      with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f), "Local JSON Cache"
     except Exception:
       return {}, "Error Loading Cache"
   return {}, "Cache File Not Found"
 
 
-def fetch_odds_api_data(user_api_key: str, force_refresh=False):
+def resolve_team_abbr_from_name(team_name: str) -> str:
+  if not team_name:
+    return ""
+  s = str(team_name).strip().lower()
+  for code, kws in NFL_TEAMS.items():
+    if any(kw == s or kw in s for kw in kws):
+      return code
+  return ""
+
+
+def filter_events_to_slate(
+    events: list[dict],
+    roster_teams: set[str] | None = None,
+    only_upcoming_7d: bool = True,
+) -> list[dict]:
+  """Filters API events to avoid spending credits on irrelevant or stale games."""
+  if not events:
+    return []
+  filtered = []
+  now_utc = datetime.datetime.now(datetime.timezone.utc)
+  max_window = now_utc + datetime.timedelta(days=7)
+
+  for ev in events:
+    commence_str = ev.get("commence_time")
+    if only_upcoming_7d and commence_str:
+      try:
+        dt_commence = datetime.datetime.fromisoformat(
+            commence_str.replace("Z", "+00:00")
+        )
+        # Skip games that finished more than 4 hours ago or are >7 days out
+        if dt_commence < (now_utc - datetime.timedelta(hours=4)):
+          continue
+        if dt_commence > max_window:
+          continue
+      except Exception:
+        pass
+
+    if roster_teams:
+      home_code = resolve_team_abbr_from_name(ev.get("home_team", ""))
+      away_code = resolve_team_abbr_from_name(ev.get("away_team", ""))
+      if (home_code and home_code not in roster_teams) and (
+          away_code and away_code not in roster_teams
+      ):
+        continue
+
+    filtered.append(ev)
+
+  return filtered if filtered else events
+
+
+def parse_uploaded_props_file(uploaded_props_file) -> dict:
+  """Parses a user-uploaded JSON or CSV file of saved API props."""
+  if uploaded_props_file is None:
+    return {}
+  try:
+    uploaded_props_file.seek(0)
+    fname = uploaded_props_file.name.lower()
+    if fname.endswith(".json"):
+      raw = json.load(uploaded_props_file)
+      if isinstance(raw, dict):
+        return raw
+    elif fname.endswith(".csv"):
+      df_p = pd.read_csv(uploaded_props_file)
+      props_dict = {}
+      for _, r in df_p.iterrows():
+        p_name = str(r.get("player_name", r.get("name", ""))).strip()
+        if not p_name:
+          continue
+        props_dict[p_name] = {
+            "expected_fp": float(r.get("expected_fp", 0.0) or 0.0),
+            "consensus_books": int(r.get("consensus_books", 1) or 1),
+            "pass_yds": float(r.get("pass_yds", 0.0) or 0.0),
+            "pass_tds": float(r.get("pass_tds", 0.0) or 0.0),
+            "ints": float(r.get("ints", 0.0) or 0.0),
+            "rush_yds": float(r.get("rush_yds", 0.0) or 0.0),
+            "rush_tds": float(r.get("rush_tds", 0.0) or 0.0),
+            "rec_yds": float(r.get("rec_yds", 0.0) or 0.0),
+            "rec_tds": float(r.get("rec_tds", 0.0) or 0.0),
+            "receptions": float(r.get("receptions", 0.0) or 0.0),
+            "anytime_td_odds": (
+                ""
+                if pd.isna(r.get("anytime_td_odds"))
+                else str(r.get("anytime_td_odds", ""))
+            ),
+            "implied_td_pct": float(r.get("implied_td_pct", 0.0) or 0.0),
+        }
+      return props_dict
+  except Exception as e:
+    st.sidebar.error(f"Error parsing uploaded props file: {e}")
+  return {}
+
+
+def props_dict_to_csv_bytes(props_dict: dict) -> bytes:
+  """Converts a consensus props dictionary into CSV bytes for saving/archiving."""
+  rows = []
+  for p_name, d in props_dict.items():
+    row = {"player_name": p_name}
+    if isinstance(d, dict):
+      row.update(d)
+    rows.append(row)
+  if not rows:
+    return b"player_name\n"
+  return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
+def fetch_odds_api_data(
+    user_api_key: str,
+    force_refresh=False,
+    roster_teams: set[str] | None = None,
+    only_upcoming_7d: bool = True,
+    uploaded_props_file=None,
+):
   import requests
 
-  status_str, age_hours, is_fresh = check_cache_status(CACHE_FILE)
+  # 1. If user uploaded a saved API props file, load and cache it without calling API
+  if uploaded_props_file is not None:
+    uploaded_map = parse_uploaded_props_file(uploaded_props_file)
+    if uploaded_map:
+      with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(uploaded_map, f, indent=2)
+      load_odds_cache_data.clear()
+      st.sidebar.success(
+          f"📂 Loaded {len(uploaded_map)} player props from uploaded file"
+          " (0 API credits used)."
+      )
+      return uploaded_map
 
-  # Use local cache if fresh and refresh is not forced
-  if is_fresh and not force_refresh and os.path.exists(CACHE_FILE):
-    data, label = load_odds_cache_data(CACHE_FILE)
-    if data:
-      return data
-
-  # Load previous cache into memory for sticky fallback merging
+  # Load previous cache into memory for fallback merging
   existing_cache, _ = load_odds_cache_data(CACHE_FILE)
+
+  # CRITICAL CREDIT PROTECTION: Only call live API if explicitly forced OR cache is missing/empty.
+  # Typing an API key or clicking UI widgets will NOT trigger API calls or burn credits.
+  if not force_refresh and existing_cache:
+    return existing_cache
 
   # Build list of keys to try: user-provided key first, then hardcoded pool
   keys_to_try = []
@@ -251,7 +373,12 @@ def fetch_odds_api_data(user_api_key: str, force_refresh=False):
       events_resp.raise_for_status()
       events = events_resp.json()
       active_key = current_key
-      st.sidebar.success(f"⚡ Connected using API Key #{idx+1}")
+      remaining_hdr = events_resp.headers.get("x-requests-remaining")
+      used_hdr = events_resp.headers.get("x-requests-used")
+      credit_info = ""
+      if remaining_hdr is not None or used_hdr is not None:
+        credit_info = f" (Used: {used_hdr or '?'} | Rem: {remaining_hdr or '?'})"
+      st.sidebar.success(f"⚡ Connected using API Key #{idx+1}{credit_info}")
       break
     except Exception:
       continue
@@ -263,6 +390,12 @@ def fetch_odds_api_data(user_api_key: str, force_refresh=False):
     )
     return existing_cache
 
+  slate_events = filter_events_to_slate(
+      events,
+      roster_teams=roster_teams,
+      only_upcoming_7d=only_upcoming_7d,
+  )
+
   try:
     raw_props = {}
     target_markets = (
@@ -270,95 +403,145 @@ def fetch_odds_api_data(user_api_key: str, force_refresh=False):
         "player_pass_tds,"
         "player_pass_interceptions,"
         "player_rush_yds,"
+        "player_rush_tds,"
         "player_reception_yds,"
+        "player_reception_tds,"
         "player_receptions,"
         "player_anytime_td"
     )
 
-    for event in events:
+    for event in slate_events:
       event_id = event["id"]
       prop_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds"
       p_params = {
           "apiKey": active_key,
           "regions": "us",
           "markets": target_markets,
+          "oddsFormat": "american",
       }
       p_resp = requests.get(prop_url, params=p_params, timeout=10)
+      if p_resp.status_code == 429:
+        st.sidebar.warning(
+            "⚠️ Hit rate/credit limit (429) mid-fetch. Stopping further calls"
+            " and using collected data."
+        )
+        break
       if p_resp.status_code == 200:
         p_data = p_resp.json()
         for bookmaker in p_data.get("bookmakers", []):
           for market in bookmaker.get("markets", []):
             m_key = market["key"]
             for outcome in market.get("outcomes", []):
-              p_name = outcome.get("description", outcome.get("name", ""))
-              if not p_name:
+              p_name = (
+                  outcome.get("description")
+                  or outcome.get("participant")
+                  or ""
+              )
+              p_name = str(p_name).strip()
+              if not p_name or p_name.lower() in [
+                  "over",
+                  "under",
+                  "yes",
+                  "no",
+              ]:
                 continue
               if p_name not in raw_props:
                 raw_props[p_name] = {}
               if m_key not in raw_props[p_name]:
                 raw_props[p_name][m_key] = []
 
-              if m_key == "player_anytime_td":
-                if outcome.get("name", "").lower() == "yes":
+              if m_key in [
+                  "player_anytime_td",
+                  "player_rush_tds",
+                  "player_reception_tds",
+              ]:
+                side_str = str(outcome.get("name", "")).lower()
+                if side_str in ["yes", "over"] or (
+                    side_str not in ["no", "under"]
+                    and outcome.get("price") is not None
+                ):
                   price = float(outcome.get("price", 0.0))
                   prob = american_to_implied_prob(price)
                   if prob > 0:
                     raw_props[p_name][m_key].append((price, prob))
               else:
-                point = float(outcome.get("point", 0.0))
-                if point > 0:
-                  raw_props[p_name][m_key].append(point)
+                point = outcome.get("point")
+                if point is not None:
+                  pt_val = float(point)
+                  if pt_val > 0:
+                    raw_props[p_name][m_key].append(pt_val)
 
     consensus_props = {}
     for p_name, markets in raw_props.items():
       p_pass_yds = (
-          np.mean(markets["player_pass_yds"])
+          float(np.mean(markets["player_pass_yds"]))
           if "player_pass_yds" in markets
           else 0.0
       )
       p_pass_tds = (
-          np.mean(markets["player_pass_tds"])
+          float(np.mean(markets["player_pass_tds"]))
           if "player_pass_tds" in markets
           else 0.0
       )
       p_ints = (
-          np.mean(markets["player_pass_interceptions"])
+          float(np.mean(markets["player_pass_interceptions"]))
           if "player_pass_interceptions" in markets
           else 0.0
       )
       p_rush_yds = (
-          np.mean(markets["player_rush_yds"])
+          float(np.mean(markets["player_rush_yds"]))
           if "player_rush_yds" in markets
           else 0.0
       )
       p_rec_yds = (
-          np.mean(markets["player_reception_yds"])
+          float(np.mean(markets["player_reception_yds"]))
           if "player_reception_yds" in markets
           else 0.0
       )
       p_rec = (
-          np.mean(markets["player_receptions"])
+          float(np.mean(markets["player_receptions"]))
           if "player_receptions" in markets
           else 0.0
       )
 
-      td_tuples = markets.get("player_anytime_td", [])
-      if td_tuples:
-        avg_price = np.mean([t[0] for t in td_tuples])
-        td_prob = np.mean([t[1] for t in td_tuples])
+      anytime_tuples = markets.get("player_anytime_td", [])
+      rush_td_tuples = markets.get("player_rush_tds", [])
+      rec_td_tuples = markets.get("player_reception_tds", [])
+
+      rush_td_prob = (
+          float(np.mean([t[1] for t in rush_td_tuples]))
+          if rush_td_tuples
+          else 0.0
+      )
+      rec_td_prob = (
+          float(np.mean([t[1] for t in rec_td_tuples]))
+          if rec_td_tuples
+          else 0.0
+      )
+
+      if anytime_tuples:
+        avg_price = float(np.mean([t[0] for t in anytime_tuples]))
+        td_prob = float(np.mean([t[1] for t in anytime_tuples]))
       else:
         avg_price = 0.0
-        td_prob = 0.0
+        td_prob = max(rush_td_prob, rec_td_prob)
+
+      eff_rush_tds = rush_td_prob if rush_td_prob > 0 else (
+          td_prob if p_pass_yds == 0 else 0.0
+      )
+      eff_rec_tds = rec_td_prob if rec_td_prob > 0 else (
+          td_prob if p_pass_yds > 0 else 0.0
+      )
 
       calc_fp = calculate_fd_expected_points(
           pass_yds=p_pass_yds,
           pass_tds=p_pass_tds,
           ints=p_ints,
           rush_yds=p_rush_yds,
-          rush_tds=td_prob if p_pass_yds == 0 else 0.0,
+          rush_tds=eff_rush_tds,
           receptions=p_rec,
           rec_yds=p_rec_yds,
-          rec_tds=td_prob if p_pass_yds > 0 else 0.0,
+          rec_tds=eff_rec_tds,
       )
       calc_fp = min(34.0, calc_fp)
       num_books = max(
@@ -366,47 +549,51 @@ def fetch_odds_api_data(user_api_key: str, force_refresh=False):
       )
 
       consensus_props[p_name] = {
-          "expected_fp": calc_fp,
+          "expected_fp": round(calc_fp, 2),
           "consensus_books": num_books,
           "pass_yds": round(p_pass_yds, 1),
           "pass_tds": round(p_pass_tds, 1),
           "ints": round(p_ints, 1),
           "rush_yds": round(p_rush_yds, 1),
+          "rush_tds": round(eff_rush_tds, 2),
           "rec_yds": round(p_rec_yds, 1),
+          "rec_tds": round(eff_rec_tds, 2),
           "receptions": round(p_rec, 1),
-          "anytime_td_odds": decimal_to_american(avg_price)
-          if avg_price > 1.0
-          else "",
-          "implied_td_pct": round(td_prob, 2),
+          "anytime_td_odds": (
+              decimal_to_american(avg_price) if avg_price > 1.0 else ""
+          ),
+          "implied_td_pct": round(td_prob * 100.0, 1) if td_prob <= 1.0 else round(td_prob, 1),
       }
 
     # --- STICKY MERGE WITH PREVIOUS CACHE ---
-    # If a player was in the previous cache with valid props but is missing/zeroed in the new pull,
-    # carry over their previous props so they don't unexpectedly drop out.
     for prev_name, prev_data in existing_cache.items():
       if prev_name not in consensus_props:
         consensus_props[prev_name] = prev_data
       else:
-        # If new pull has 0 props across key categories but old cache had valid numbers, merge selectively
         new_item = consensus_props[prev_name]
         if (
-            new_item["pass_yds"] == 0.0
-            and new_item["rush_yds"] == 0.0
-            and new_item["rec_yds"] == 0.0
-            and not new_item["anytime_td_odds"]
+            new_item.get("pass_yds", 0.0) == 0.0
+            and new_item.get("rush_yds", 0.0) == 0.0
+            and new_item.get("rec_yds", 0.0) == 0.0
+            and not new_item.get("anytime_td_odds")
+            and new_item.get("implied_td_pct", 0.0) == 0.0
         ):
           if (
-              prev_data["pass_yds"] > 0
-              or prev_data["rush_yds"] > 0
-              or prev_data["rec_yds"] > 0
-              or prev_data["anytime_td_odds"]
+              prev_data.get("pass_yds", 0.0) > 0
+              or prev_data.get("rush_yds", 0.0) > 0
+              or prev_data.get("rec_yds", 0.0) > 0
+              or prev_data.get("anytime_td_odds")
+              or prev_data.get("implied_td_pct", 0.0) > 0
           ):
             consensus_props[prev_name] = prev_data
 
-    with open(CACHE_FILE, "w") as f:
-      json.dump(consensus_props, f)
+    # ANTI-WIPE GUARD: Only overwrite cache if we successfully retrieved props
+    if consensus_props:
+      with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(consensus_props, f, indent=2)
+      load_odds_cache_data.clear()
 
-    return consensus_props
+    return consensus_props if consensus_props else existing_cache
   except Exception as e:
     st.sidebar.error(f"API Fetch Error: {e}")
     return existing_cache
@@ -522,6 +709,27 @@ def get_canonical_key(name, team="", position=""):
     ).strip()
     return f"DEF_{norm_name}"
   return normalize_player_key(raw_name)
+
+
+def find_matching_api_prop(p_key: str, api_norm_lookup: dict) -> dict | None:
+  """Exact normalized key match first, then high-confidence fuzzy match."""
+  if p_key in api_norm_lookup:
+    return api_norm_lookup[p_key]
+  p_parts = p_key.split()
+  if not p_parts:
+    return None
+  p_last = p_parts[-1]
+  best_data = None
+  best_ratio = 0.0
+  for ak, adata in api_norm_lookup.items():
+    ak_parts = ak.split()
+    if not ak_parts or ak_parts[-1] != p_last:
+      continue
+    ratio = difflib.SequenceMatcher(None, p_key, ak).ratio()
+    if ratio >= 0.88 and ratio > best_ratio:
+      best_ratio = ratio
+      best_data = adata
+  return best_data
 
 
 # -----------------------------------------------------------------------------
@@ -883,8 +1091,18 @@ def load_combined_data(
     api_key="",
     force_api_refresh=False,
     default_espn_path="espn_projections.csv",
+    only_upcoming_7d=True,
+    uploaded_props_file=None,
 ):
   fd_df, fd_name = load_fd_csv(fd_file)
+
+  roster_teams = set()
+  if not fd_df.empty and "team" in fd_df.columns:
+    roster_teams = {
+        str(t).strip().upper()
+        for t in fd_df["team"].dropna().unique()
+        if str(t).strip()
+    }
 
   vegas_source = None
   if vegas_file is not None:
@@ -899,7 +1117,11 @@ def load_combined_data(
   )
   espn_map = extract_espn_projections_map(espn_file, default_espn_path)
   api_props_map = fetch_odds_api_data(
-      user_api_key=api_key, force_refresh=force_api_refresh
+      user_api_key=api_key,
+      force_refresh=force_api_refresh,
+      roster_teams=roster_teams,
+      only_upcoming_7d=only_upcoming_7d,
+      uploaded_props_file=uploaded_props_file,
   )
 
   if not fd_df.empty:
@@ -934,31 +1156,40 @@ def load_combined_data(
     df["Anytime TD Odds"] = df["Anytime TD Odds"].astype("object")
 
     if api_props_map:
+      api_norm_lookup = {
+          normalize_player_key(k): v
+          for k, v in api_props_map.items()
+          if normalize_player_key(k)
+      }
       api_matched_count = 0
       for idx, row in df.iterrows():
-        p_name = row["name"]
-        p_key = normalize_player_key(p_name)
-        for api_p_name, api_data in api_props_map.items():
-          if normalize_player_key(api_p_name) == p_key:
-            calc_fp = api_data["expected_fp"]
-            if calc_fp > 0:
-              df.at[idx, "vegas_proj"] = calc_fp
-              df.at[
-                  idx, "proj_source_log"
-              ] = f"Excel + ESPN + API ({api_data['consensus_books']} Books)"
-              df.at[idx, "Pass Yds Prop"] = api_data.get("pass_yds", 0.0)
-              df.at[idx, "Pass TD Prop"] = api_data.get("pass_tds", 0.0)
-              df.at[idx, "INT Prop"] = api_data.get("ints", 0.0)
-              df.at[idx, "Rush Yds Prop"] = api_data.get("rush_yds", 0.0)
-              df.at[idx, "Rec Yds Prop"] = api_data.get("rec_yds", 0.0)
-              df.at[idx, "Receptions Prop"] = api_data.get("receptions", 0.0)
-              df.at[idx, "Anytime TD Odds"] = api_data.get("anytime_td_odds", "")
-              df.at[idx, "Implied TD %"] = api_data.get("implied_td_pct", 0.0)
-              api_matched_count += 1
-            break
+        p_key = normalize_player_key(row["name"])
+        api_data = find_matching_api_prop(p_key, api_norm_lookup)
+        if api_data is not None:
+          calc_fp = float(api_data.get("expected_fp", 0.0) or 0.0)
+          df.at[idx, "Pass Yds Prop"] = float(api_data.get("pass_yds", 0.0) or 0.0)
+          df.at[idx, "Pass TD Prop"] = float(api_data.get("pass_tds", 0.0) or 0.0)
+          df.at[idx, "INT Prop"] = float(api_data.get("ints", 0.0) or 0.0)
+          df.at[idx, "Rush Yds Prop"] = float(api_data.get("rush_yds", 0.0) or 0.0)
+          df.at[idx, "Rec Yds Prop"] = float(api_data.get("rec_yds", 0.0) or 0.0)
+          df.at[idx, "Receptions Prop"] = float(
+              api_data.get("receptions", 0.0) or 0.0
+          )
+          df.at[idx, "Anytime TD Odds"] = api_data.get("anytime_td_odds", "")
+          df.at[idx, "Implied TD %"] = float(
+              api_data.get("implied_td_pct", 0.0) or 0.0
+          )
+          if calc_fp > 0:
+            df.at[idx, "vegas_proj"] = calc_fp
+          df.at[
+              idx, "proj_source_log"
+          ] = f"Excel + ESPN + API ({api_data.get('consensus_books', 1)} Books)"
+          api_matched_count += 1
+
       if api_matched_count > 0:
         st.sidebar.success(
-            f"⚡ Ingested Consensus Props for {api_matched_count} Players!"
+            f"⚡ Matched Props for {api_matched_count} Roster Players"
+            f" ({len(api_props_map)} total in API pool)"
         )
 
     def_mask = df["position"].apply(standardize_position) == "DEF"
@@ -987,6 +1218,9 @@ uploaded_espn = st.sidebar.file_uploader(
 uploaded_vegas = st.sidebar.file_uploader(
     "Upload Vegas Workbook (.xlsx)", type=["xlsx"]
 )
+uploaded_saved_props = st.sidebar.file_uploader(
+    "Upload Saved API Props (JSON / CSV)", type=["json", "csv"]
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚡ Live API & Cache Settings")
@@ -994,6 +1228,10 @@ cache_status_str, cache_age_hours, cache_is_fresh = check_cache_status(CACHE_FIL
 st.sidebar.info(
     f"**Odds Cache Status:** {cache_status_str}\n\n**File Age:**"
     f" {cache_age_hours:.1f} hours"
+)
+
+only_upcoming_7d = st.sidebar.checkbox(
+    "Only Pull Upcoming 7-Day Slate Games (Saves Credits)", value=True
 )
 
 try:
@@ -1007,8 +1245,28 @@ odds_api_key = st.sidebar.text_input(
 
 force_api_refresh = st.sidebar.button(
     "🔄 Force API Refresh (Burns Credits)",
-    help="Bypasses the 24-hour clock and hits The Odds API live.",
+    help="Bypasses cache and hits The Odds API live.",
 )
+
+# Export buttons for saving pulled API props to disk/computer
+current_cache_for_export, _ = load_odds_cache_data(CACHE_FILE)
+if current_cache_for_export:
+  st.sidebar.markdown("**💾 Save / Archive Pulled API Props:**")
+  dl_col1, dl_col2 = st.sidebar.columns(2)
+  dl_col1.download_button(
+      label="JSON",
+      data=json.dumps(current_cache_for_export, indent=2).encode("utf-8"),
+      file_name="api_player_props_snapshot.json",
+      mime="application/json",
+      help="Save pulled API props JSON so you can upload it back anytime.",
+  )
+  dl_col2.download_button(
+      label="CSV",
+      data=props_dict_to_csv_bytes(current_cache_for_export),
+      file_name="api_player_props_snapshot.csv",
+      mime="text/csv",
+      help="Save pulled API props CSV for spreadsheet review or re-upload.",
+  )
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙ Blending Weights")
@@ -1196,6 +1454,8 @@ raw_df = load_combined_data(
     uploaded_vegas,
     api_key=odds_api_key,
     force_api_refresh=force_api_refresh,
+    only_upcoming_7d=only_upcoming_7d,
+    uploaded_props_file=uploaded_saved_props,
 )
 if raw_df.empty:
   st.warning(
@@ -1690,7 +1950,7 @@ with tab1:
           "Rush Yds Prop": "{:.1f}",
           "Rec Yds Prop": "{:.1f}",
           "Receptions Prop": "{:.1f}",
-          "Implied TD %": "{:.2f}",
+          "Implied TD %": "{:.1f}",
           "ceiling": "{:.1f}",
           "value": "{:.2f}",
           "leverage": "{:.2f}",
@@ -1931,7 +2191,7 @@ with tab3:
       port_ub = [num_lineups_target]
 
       max_allowed_appearances = max(
-          1, int(np.floor(max_exposure * num_lineups_target))
+          1, int(np.ceil(max_exposure * num_lineups_target))
       )
       for p_i in range(N_pool):
         port_A_rows.append(cand_matrix[p_i, :])
@@ -2038,7 +2298,6 @@ with tab4:
         is_def = (pool_pos == "DEF").to_numpy()
         salaries = pool["salary"].to_numpy()
 
-
         def safe_sample(df_sub, count):
           weights = df_sub["proj_ownership"].values
           w_sum = weights.sum()
@@ -2048,7 +2307,6 @@ with tab4:
               else np.ones(len(df_sub)) / len(df_sub)
           )
           return df_sub.sample(n=count, replace=False, weights=p).index.tolist()
-
 
         field_indices = []
         attempts = 0
@@ -2209,12 +2467,13 @@ with tab4:
           hide_index=True,
       )
 
-      # --- FANDUEL MASS CSV EXPORT W/ PLAYER ID CODES ---
+      # --- FANDUEL MASS CSV EXPORT W/ EXACT POSITION ORDER ---
       st.markdown("---")
       st.subheader("📥 Export Lineups for FanDuel Mass CSV Edit")
       st.markdown(
           "Select individual lineups or check 'Select All', then download the"
-          " CSV formatted with official FanDuel player ID numeric codes."
+          " CSV formatted with official FanDuel player ID numeric codes in exact"
+          " position order (`QB, RB, RB, WR, WR, WR, TE, FLEX, DEF`)."
       )
 
       sel_cols_ex1, sel_cols_ex2 = st.columns([1, 3])
@@ -2238,38 +2497,73 @@ with tab4:
         fd_export_rows = []
         for l_idx in selected_lineup_indices:
           lu_df = portfolio[l_idx]
-          row_dict = {}
+
+          qb_id = ""
+          rb_ids = []
+          wr_ids = []
+          te_id = ""
+          def_id = ""
+          flex_id = ""
+
           for _, p_row in lu_df.iterrows():
             pos = standardize_position(p_row.get("position", ""))
             p_id = str(p_row.get("player_id", ""))
             if not p_id or p_id.lower() == "nan":
               p_id = str(p_row.get("name", ""))
 
-            if pos == "QB" and "QB" not in row_dict:
-              row_dict["QB"] = p_id
+            if pos == "QB" and not qb_id:
+              qb_id = p_id
             elif pos == "RB":
-              if "RB1" not in row_dict:
-                row_dict["RB1"] = p_id
-              elif "RB2" not in row_dict:
-                row_dict["RB2"] = p_id
-              else:
-                row_dict["FLEX"] = p_id
+              rb_ids.append(p_id)
             elif pos == "WR":
-              if "WR1" not in row_dict:
-                row_dict["WR1"] = p_id
-              elif "WR2" not in row_dict:
-                row_dict["WR2"] = p_id
-              elif "WR3" not in row_dict:
-                row_dict["WR3"] = p_id
-              else:
-                row_dict["FLEX"] = p_id
-            elif pos == "TE" and "TE" not in row_dict:
-              row_dict["TE"] = p_id
-            elif pos == "DEF" and "DEF" not in row_dict:
-              row_dict["DEF"] = p_id
-            else:
-              row_dict["FLEX"] = p_id
+              wr_ids.append(p_id)
+            elif pos == "TE" and not te_id:
+              te_id = p_id
+            elif pos == "DEF" and not def_id:
+              def_id = p_id
 
+          final_qb = qb_id
+          final_rb1 = rb_ids[0] if len(rb_ids) > 0 else ""
+          final_rb2 = rb_ids[1] if len(rb_ids) > 1 else ""
+
+          final_wr1 = wr_ids[0] if len(wr_ids) > 0 else ""
+          final_wr2 = wr_ids[1] if len(wr_ids) > 1 else ""
+          final_wr3 = wr_ids[2] if len(wr_ids) > 2 else ""
+
+          final_te = te_id
+          final_def = def_id
+
+          used_ids = {
+              final_qb,
+              final_rb1,
+              final_rb2,
+              final_wr1,
+              final_wr2,
+              final_wr3,
+              final_te,
+              final_def,
+          }
+          for _, p_row in lu_df.iterrows():
+            p_id = str(p_row.get("player_id", ""))
+            if not p_id or p_id.lower() == "nan":
+              p_id = str(p_row.get("name", ""))
+            if p_id not in used_ids:
+              final_flex = p_id
+              break
+          else:
+            final_flex = ""
+
+          row_dict = {
+              "QB": final_qb,
+              "RB": final_rb1,
+              "RB.1": final_rb2,
+              "WR": final_wr1,
+              "WR.1": final_wr2,
+              "WR.2": final_wr3,
+              "TE": final_te,
+              "FLEX": final_flex,
+              "DEF": final_def,
+          }
           fd_export_rows.append(row_dict)
 
         fd_export_df = pd.DataFrame(fd_export_rows)
@@ -2288,7 +2582,6 @@ with tab4:
       else:
         st.warning("⚠️ Please select at least one lineup to export.")
 
-      # Lineup Roster Inspector
       st.markdown("---")
       st.subheader("🔍 Inspect Portfolio Lineup Rosters")
       inspect_lu_num = st.selectbox(
@@ -2389,7 +2682,9 @@ with tab5:
             for _, row in wf_df.iterrows():
               wk = int(row.get("week", 1))
               pkey = normalize_player_key(row.get("name", ""))
-              matched_actual = calc_actuals_map.get((pkey, wk), row.get("actual", 0.0))
+              matched_actual = calc_actuals_map.get(
+                  (pkey, wk), row.get("actual", 0.0)
+              )
               updated_actuals.append(matched_actual)
 
             wf_df["actual"] = updated_actuals
@@ -2403,7 +2698,14 @@ with tab5:
 
       active_wf_df = st.session_state.get("wf_df_processed", wf_df)
 
-      required_cols = ["week", "name", "position", "salary", "projection", "actual"]
+      required_cols = [
+          "week",
+          "name",
+          "position",
+          "salary",
+          "projection",
+          "actual",
+      ]
       missing_cols = [c for c in required_cols if c not in active_wf_df.columns]
 
       if missing_cols:
