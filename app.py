@@ -227,7 +227,6 @@ def filter_events_to_slate(
         dt_commence = datetime.datetime.fromisoformat(
             commence_str.replace("Z", "+00:00")
         )
-        # Skip games that finished more than 4 hours ago or are >7 days out
         if dt_commence < (now_utc - datetime.timedelta(hours=4)):
           continue
         if dt_commence > max_window:
@@ -312,7 +311,6 @@ def fetch_odds_api_data(
 ):
   import requests
 
-  # 1. If user uploaded a saved API props file, load and cache it without calling API
   if uploaded_props_file is not None:
     uploaded_map = parse_uploaded_props_file(uploaded_props_file)
     if uploaded_map:
@@ -325,15 +323,11 @@ def fetch_odds_api_data(
       )
       return uploaded_map
 
-  # Load previous cache into memory for fallback merging
   existing_cache, _ = load_odds_cache_data(CACHE_FILE)
 
-  # CRITICAL CREDIT PROTECTION: Only call live API if explicitly forced OR cache is missing/empty.
-  # Typing an API key or clicking UI widgets will NOT trigger API calls or burn credits.
   if not force_refresh and existing_cache:
     return existing_cache
 
-  # Build list of keys to try: user-provided key first, then hardcoded pool
   keys_to_try = []
   if user_api_key and user_api_key.strip():
     keys_to_try.append(user_api_key.strip())
@@ -352,7 +346,6 @@ def fetch_odds_api_data(
   events = []
   active_key = None
 
-  # Rotate through keys until one successfully connects
   for idx, current_key in enumerate(keys_to_try):
     try:
       events_resp = requests.get(
@@ -526,11 +519,15 @@ def fetch_odds_api_data(
         avg_price = 0.0
         td_prob = max(rush_td_prob, rec_td_prob)
 
-      eff_rush_tds = rush_td_prob if rush_td_prob > 0 else (
-          td_prob if p_pass_yds == 0 else 0.0
+      eff_rush_tds = (
+          rush_td_prob
+          if rush_td_prob > 0
+          else (td_prob if p_pass_yds == 0 else 0.0)
       )
-      eff_rec_tds = rec_td_prob if rec_td_prob > 0 else (
-          td_prob if p_pass_yds > 0 else 0.0
+      eff_rec_tds = (
+          rec_td_prob
+          if rec_td_prob > 0
+          else (td_prob if p_pass_yds > 0 else 0.0)
       )
 
       calc_fp = calculate_fd_expected_points(
@@ -562,10 +559,11 @@ def fetch_odds_api_data(
           "anytime_td_odds": (
               decimal_to_american(avg_price) if avg_price > 1.0 else ""
           ),
-          "implied_td_pct": round(td_prob * 100.0, 1) if td_prob <= 1.0 else round(td_prob, 1),
+          "implied_td_pct": (
+              round(td_prob * 100.0, 1) if td_prob <= 1.0 else round(td_prob, 1)
+          ),
       }
 
-    # --- STICKY MERGE WITH PREVIOUS CACHE ---
     for prev_name, prev_data in existing_cache.items():
       if prev_name not in consensus_props:
         consensus_props[prev_name] = prev_data
@@ -587,7 +585,6 @@ def fetch_odds_api_data(
           ):
             consensus_props[prev_name] = prev_data
 
-    # ANTI-WIPE GUARD: Only overwrite cache if we successfully retrieved props
     if consensus_props:
       with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(consensus_props, f, indent=2)
@@ -1143,7 +1140,6 @@ def load_combined_data(
         df["espn_proj"] > 0, df["espn_proj"], vegas_espn_series
     )
 
-    # Initialize Source Lineage Tracking and Raw Prop Columns safely
     df["proj_source_log"] = "Excel (Proj) + ESPN (Status)"
     df["Pass Yds Prop"] = 0.0
     df["Pass TD Prop"] = 0.0
@@ -1167,11 +1163,19 @@ def load_combined_data(
         api_data = find_matching_api_prop(p_key, api_norm_lookup)
         if api_data is not None:
           calc_fp = float(api_data.get("expected_fp", 0.0) or 0.0)
-          df.at[idx, "Pass Yds Prop"] = float(api_data.get("pass_yds", 0.0) or 0.0)
-          df.at[idx, "Pass TD Prop"] = float(api_data.get("pass_tds", 0.0) or 0.0)
+          df.at[idx, "Pass Yds Prop"] = float(
+              api_data.get("pass_yds", 0.0) or 0.0
+          )
+          df.at[idx, "Pass TD Prop"] = float(
+              api_data.get("pass_tds", 0.0) or 0.0
+          )
           df.at[idx, "INT Prop"] = float(api_data.get("ints", 0.0) or 0.0)
-          df.at[idx, "Rush Yds Prop"] = float(api_data.get("rush_yds", 0.0) or 0.0)
-          df.at[idx, "Rec Yds Prop"] = float(api_data.get("rec_yds", 0.0) or 0.0)
+          df.at[idx, "Rush Yds Prop"] = float(
+              api_data.get("rush_yds", 0.0) or 0.0
+          )
+          df.at[idx, "Rec Yds Prop"] = float(
+              api_data.get("rec_yds", 0.0) or 0.0
+          )
           df.at[idx, "Receptions Prop"] = float(
               api_data.get("receptions", 0.0) or 0.0
           )
@@ -1248,7 +1252,6 @@ force_api_refresh = st.sidebar.button(
     help="Bypasses cache and hits The Odds API live.",
 )
 
-# Export buttons for saving pulled API props to disk/computer
 current_cache_for_export, _ = load_odds_cache_data(CACHE_FILE)
 if current_cache_for_export:
   st.sidebar.markdown("**💾 Save / Archive Pulled API Props:**")
@@ -1861,7 +1864,6 @@ with tab1:
   if search_term:
     view_df = view_df[view_df["name"].str.lower().str.contains(search_term)]
 
-  # Position-Aware Display Column Mapping
   if selected_pos == "QB":
     display_cols = [
         "name",
@@ -2059,7 +2061,11 @@ with tab3:
         st.stop()
 
       weather_penalized_games = set()
-      if enable_weather_impact and "game_weather_settings" in locals():
+      if (
+          enable_weather_impact
+          and avoid_weather_stacks
+          and "game_weather_settings" in locals()
+      ):
         for g_name, g_settings in game_weather_settings.items():
           if any(
               w in g_settings["severity"]
@@ -2086,11 +2092,12 @@ with tab3:
           "optimizer_score"
       ].to_numpy()
       candidate_lineups = []
+      seen_lineup_sets = set()
       historical_lineup_indices = []
       total_candidates_to_gen = num_lineups_target * pool_size_multiplier
 
       for _ in range(total_candidates_to_gen):
-        scores = base_scores * (1.0 + np.random.normal(0, 0.12, N_pool))
+        scores = base_scores * (1.0 + np.random.normal(0, 0.15, N_pool))
         A_rows = [salaries, np.ones(N_pool)]
         lb_list, ub_list = [0, target_roster_size], [60000, target_roster_size]
 
@@ -2152,8 +2159,11 @@ with tab3:
         )
         if res.success:
           sel = np.where(res.x > 0.5)[0]
+          sel_key = tuple(sorted(sel.tolist()))
           historical_lineup_indices.append(sel)
-          candidate_lineups.append(sel)
+          if sel_key not in seen_lineup_sets:
+            seen_lineup_sets.add(sel_key)
+            candidate_lineups.append(sel)
 
       if not candidate_lineups:
         st.error("Could not generate candidate pool. Adjust constraints.")
@@ -2186,43 +2196,65 @@ with tab3:
       for c_idx, c_indices in enumerate(candidate_lineups):
         cand_matrix[c_indices, c_idx] = 1.0
 
-      port_A_rows = [np.ones(M)]
-      port_lb = [num_lineups_target]
-      port_ub = [num_lineups_target]
+      desired_count = min(num_lineups_target, M)
+      selected_cand_indices = None
 
-      max_allowed_appearances = max(
-          1, int(np.ceil(max_exposure * num_lineups_target))
-      )
-      for p_i in range(N_pool):
-        port_A_rows.append(cand_matrix[p_i, :])
-        port_lb.append(0)
-        port_ub.append(max_allowed_appearances)
+      for exp_attempt in [max_exposure, 0.75, 0.90, 1.0]:
+        if exp_attempt < max_exposure:
+          continue
+        port_A_rows = [np.ones(M)]
+        port_lb = [desired_count]
+        port_ub = [desired_count]
 
-      port_res = milp(
-          c=-candidate_utility,
-          integrality=np.ones(M),
-          bounds=Bounds(lb=0, ub=1),
-          constraints=LinearConstraint(
-              np.vstack(port_A_rows), np.array(port_lb), np.array(port_ub)
-          ),
-      )
+        max_allowed_appearances = max(
+            1, int(np.ceil(exp_attempt * desired_count))
+        )
+        for p_i in range(N_pool):
+          port_A_rows.append(cand_matrix[p_i, :])
+          port_lb.append(0)
+          port_ub.append(max_allowed_appearances)
 
-      if port_res.success:
-        selected_cand_indices = np.where(port_res.x > 0.5)[0]
+        port_res = milp(
+            c=-candidate_utility,
+            integrality=np.ones(M),
+            bounds=Bounds(lb=0, ub=1),
+            constraints=LinearConstraint(
+                np.vstack(port_A_rows), np.array(port_lb), np.array(port_ub)
+            ),
+        )
+        if port_res.success:
+          selected_cand_indices = np.where(port_res.x > 0.5)[0]
+          if exp_attempt > max_exposure:
+            st.warning(
+                f"Requested {max_exposure*100:.0f}% max exposure was too"
+                f" tight for the {M} candidate lineups; automatically solved"
+                f" using {exp_attempt*100:.0f}% max exposure."
+            )
+          break
+
+      if selected_cand_indices is not None and len(selected_cand_indices) > 0:
         final_portfolio = [
             pool.iloc[candidate_lineups[idx]].copy()
             for idx in selected_cand_indices
         ]
-
         st.session_state["last_generated_portfolio"] = final_portfolio
+        for lu_i in range(len(final_portfolio)):
+          st.session_state[f"exp_lu_{lu_i+1}"] = True
         st.success(
             f"Successfully optimized global portfolio of {len(final_portfolio)}"
-            f" lineups from a candidate pool of {M}!"
+            f" lineups from {M} unique candidate lineups!"
         )
       else:
-        st.error(
-            "Portfolio selection solver could not satisfy global exposure"
-            " constraints. Try loosening max exposure."
+        top_idx = np.argsort(-candidate_utility)[:desired_count]
+        final_portfolio = [
+            pool.iloc[candidate_lineups[idx]].copy() for idx in top_idx
+        ]
+        st.session_state["last_generated_portfolio"] = final_portfolio
+        for lu_i in range(len(final_portfolio)):
+          st.session_state[f"exp_lu_{lu_i+1}"] = True
+        st.warning(
+            f"Exposure constraints could not be met across {M} candidates;"
+            f" returned top {len(final_portfolio)} utility lineups instead."
         )
 
   if "last_generated_portfolio" in st.session_state:
@@ -2467,17 +2499,34 @@ with tab4:
           hide_index=True,
       )
 
-      # --- FANDUEL MASS CSV EXPORT W/ EXACT POSITION ORDER ---
+      # --- FANDUEL MASS CSV EXPORT W/ EXACT POSITION ORDER & SELECT/DESELECT TOGGLE ---
       st.markdown("---")
       st.subheader("📥 Export Lineups for FanDuel Mass CSV Edit")
       st.markdown(
-          "Select individual lineups or check 'Select All', then download the"
-          " CSV formatted with official FanDuel player ID numeric codes in exact"
-          " position order (`QB, RB, RB, WR, WR, WR, TE, FLEX, DEF`)."
+          "Select individual lineups or use the toggle button below, then"
+          " download the CSV formatted with official FanDuel player ID numeric"
+          " codes in exact position order (`QB, RB, RB, WR, WR, WR, TE, FLEX,"
+          " DEF`)."
+      )
+
+      for idx in range(len(portfolio)):
+        if f"exp_lu_{idx+1}" not in st.session_state:
+          st.session_state[f"exp_lu_{idx+1}"] = True
+
+      all_selected = all(
+          st.session_state.get(f"exp_lu_{idx+1}", True)
+          for idx in range(len(portfolio))
       )
 
       sel_cols_ex1, sel_cols_ex2 = st.columns([1, 3])
-      select_all_box = sel_cols_ex1.checkbox("Select All Lineups", value=True)
+      toggle_label = (
+          "☐ Deselect All Lineups" if all_selected else "☑️ Select All Lineups"
+      )
+      if sel_cols_ex1.button(toggle_label, key="toggle_select_all_lineups"):
+        new_state = not all_selected
+        for idx in range(len(portfolio)):
+          st.session_state[f"exp_lu_{idx+1}"] = new_state
+        st.rerun()
 
       selected_lineup_indices = []
       st.write("**Choose Individual Lineups to Export:**")
@@ -2487,7 +2536,6 @@ with tab4:
         with chk_cols[col_idx]:
           is_sel = st.checkbox(
               f"Lineup #{idx+1}",
-              value=select_all_box,
               key=f"exp_lu_{idx+1}",
           )
           if is_sel:
