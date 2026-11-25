@@ -45,16 +45,16 @@ CACHE_FILE = APP_DIR / "odds_cache.json"
 CACHE_EXPIRY_SECONDS = 24 * 60 * 60  # 24 hours
 
 # -----------------------------------------------------------------------------
-# HARDCODED API KEYS ROTATION POOL (Updated with fresh keys)
+# HARDCODED API KEYS ROTATION POOL (Synced with user's active key order)
 # -----------------------------------------------------------------------------
 FALLBACK_API_KEYS = [
-    "9d005ec0eb665c3ce52c0ba109d6030c",
-    "9cb2283a9131c1cc6fe3185d25b7c68e",
     "820c20a0c8f1690b173ea97be76556b8",
     "9a7da4e97cd144123ed2e84ba3ac147e",
     "d1911c691f3d8cdb7ecef7767fc3bdf8",
     "66b08ba88184aab99e9bb0d1fad83bca",
     "49875f488a183578e045b693cef295ae",
+    "9d005ec0eb665c3ce52c0ba109d6030c",
+    "9cb2283a9131c1cc6fe3185d25b7c68e",
 ]
 
 # --- PERMANENT HEADER LAYOUT WITH LOGO ---
