@@ -1,0 +1,190 @@
+(async function() {
+    let allCsvRows = [];
+    let seenPlayers = new Set();
+    let pageCount = 1;
+    const MAX_PAGES = 30; // Set high enough to sweep through all 21+ pages
+
+    // Full synthetic mouse event dispatcher to reliably trigger React event handlers
+    function simulateClick(element) {
+        if (!element) return;
+        element.scrollIntoView({ behavior: 'auto', block: 'center' });
+        ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'].forEach(eventType => {
+            let event = new MouseEvent(eventType, {
+                view: window,
+                bubbles: true,
+                cancelable: true,
+                buttons: 1
+            });
+            element.dispatchEvent(event);
+        });
+    }
+
+    // Extract table rows directly from tbody across ESPN's split side-by-side tables
+    function getPageDataRows() {
+        let tables = Array.from(document.querySelectorAll('table'));
+        if (tables.length === 0) return [];
+
+        let leftTable = tables[0];
+        let rightTable = tables.length >= 2 ? tables[1] : null;
+
+        let leftBodyRows = Array.from(leftTable.querySelectorAll('tbody tr'));
+        
+        if (rightTable) {
+            let rightBodyRows = Array.from(rightTable.querySelectorAll('tbody tr'));
+            let combined = [];
+            let maxLen = Math.max(leftBodyRows.length, rightBodyRows.length);
+            
+            for (let i = 0; i < maxLen; i++) {
+                let leftCols = leftBodyRows[i] ? Array.from(leftBodyRows[i].querySelectorAll('td, th')).map(c => c.innerText.trim()) : [];
+                let rightCols = rightBodyRows[i] ? Array.from(rightBodyRows[i].querySelectorAll('td, th')).map(c => c.innerText.trim()) : [];
+                combined.push([...leftCols, ...rightCols]);
+            }
+            return combined;
+        } else {
+            return leftBodyRows.map(row => 
+                Array.from(row.querySelectorAll('td, th')).map(c => c.innerText.trim())
+            );
+        }
+    }
+
+    // Extract table column headers
+    function getHeaderRow() {
+        let tables = Array.from(document.querySelectorAll('table'));
+        if (tables.length === 0) return [];
+
+        let leftHeaders = Array.from(tables[0].querySelectorAll('thead tr, tr:not(tbody tr)'));
+        let rightHeaders = tables.length >= 2 ? Array.from(tables[1].querySelectorAll('thead tr, tr:not(tbody tr)')) : [];
+
+        let leftCols = leftHeaders.length > 0 ? Array.from(leftHeaders[leftHeaders.length - 1].querySelectorAll('th, td')).map(c => c.innerText.trim()) : [];
+        let rightCols = rightHeaders.length > 0 ? Array.from(rightHeaders[rightHeaders.length - 1].querySelectorAll('th, td')).map(c => c.innerText.trim()) : [];
+
+        return [...leftCols, ...rightCols];
+    }
+
+    function formatCsvRow(rowArray) {
+        return rowArray.map(cell => `"${cell.replace(/"/g, '""')}"`).join(',');
+    }
+
+    // Cascading button locator for ESPN's Next Page pagination control
+    function getNextButton() {
+        // 1. Direct ESPN pagination arrow class
+        let btn = document.querySelector('button.pagination__nav--next') || 
+                  document.querySelector('button[class*="pagination__nav--next"]') ||
+                  document.querySelector('button[class*="nav--next"]');
+        if (btn && !btn.disabled) return btn;
+
+        // 2. Button with 'next' aria-label or title
+        let allButtons = Array.from(document.querySelectorAll('button:not(:disabled)'));
+        btn = allButtons.find(b => {
+            let aria = (b.getAttribute('aria-label') || '').toLowerCase();
+            let title = (b.getAttribute('title') || '').toLowerCase();
+            return aria.includes('next') || title.includes('next');
+        });
+        if (btn) return btn;
+
+        // 3. Last button in pagination navigation block
+        let pagNav = document.querySelector('.pagination__nav, [class*="Pagination"], [class*="pagination"]');
+        if (pagNav) {
+            let navBtns = Array.from(pagNav.querySelectorAll('button:not(:disabled)'));
+            if (navBtns.length > 0) {
+                let lastBtn = navBtns[navBtns.length - 1];
+                let label = (lastBtn.getAttribute('aria-label') || lastBtn.className || '').toLowerCase();
+                if (!label.includes('prev') && !label.includes('back')) {
+                    return lastBtn;
+                }
+            }
+        }
+
+        // 4. Button containing right chevron/arrow SVG icon
+        btn = allButtons.find(b => {
+            let html = b.innerHTML.toLowerCase();
+            return html.includes('icon-arr-right') || html.includes('chevron-right') || html.includes('arr-right');
+        });
+        if (btn && !btn.disabled) return btn;
+
+        return null;
+    }
+
+    while (pageCount <= MAX_PAGES) {
+        console.log(`\n--- PAGE ${pageCount} ---`);
+
+        let dataRows = getPageDataRows();
+        if (dataRows.length === 0) {
+            console.log("No data rows found on current page. Stopping.");
+            break;
+        }
+
+        // Store CSV column headers once on Page 1
+        if (allCsvRows.length === 0) {
+            let header = getHeaderRow();
+            if (header.length > 0) {
+                allCsvRows.push(formatCsvRow(header));
+            }
+        }
+
+        let addedThisPage = 0;
+        let firstPlayerOnCurrentPage = dataRows[0].slice(0, 2).join('|');
+
+        for (let rowData of dataRows) {
+            let playerKey = rowData.slice(0, 3).join('|');
+            if (playerKey.length > 0 && !seenPlayers.has(playerKey)) {
+                seenPlayers.add(playerKey);
+                allCsvRows.push(formatCsvRow(rowData));
+                addedThisPage++;
+            }
+        }
+
+        console.log(`Page ${pageCount}: Scraped ${addedThisPage} new players. Total unique players so far: ${seenPlayers.size}`);
+
+        let nextBtn = getNextButton();
+        if (!nextBtn) {
+            console.log("No active Next button found or reached the final page. Scraping complete!");
+            break;
+        }
+
+        console.log("Triggering Next page click...");
+        simulateClick(nextBtn);
+
+        // Poll the DOM every 250ms to verify page transition
+        let pageUpdated = false;
+        for (let attempt = 1; attempt <= 20; attempt++) {
+            await new Promise(r => setTimeout(r, 250));
+            
+            let currentRows = getPageDataRows();
+            if (currentRows.length > 0) {
+                let currentFirstPlayer = currentRows[0].slice(0, 2).join('|');
+                if (currentFirstPlayer !== firstPlayerOnCurrentPage) {
+                    pageUpdated = true;
+                    console.log(`Page ${pageCount + 1} loaded! Top player: ${currentFirstPlayer.replace(/\n/g, ' ')}`);
+                    break;
+                }
+            }
+
+            // Retry click if React hasn't triggered after 1.5 seconds
+            if (attempt === 6) {
+                console.log("DOM slow to respond; re-sending synthetic click event...");
+                let retryBtn = getNextButton();
+                if (retryBtn) simulateClick(retryBtn);
+            }
+        }
+
+        if (!pageUpdated) {
+            console.warn(`Stopped at Page ${pageCount}: Page did not advance after multiple click attempts.`);
+            break;
+        }
+
+        pageCount++;
+    }
+
+    // Export output CSV
+    if (allCsvRows.length > 0) {
+        let blob = new Blob([allCsvRows.join('\n')], { type: 'text/csv' });
+        let a = document.createElement('a');
+        a.href = window.URL.createObjectURL(blob);
+        a.download = 'espn_projections.csv';
+        a.click();
+        console.log(`\n[SUCCESS] Extracted ${seenPlayers.size} unique players across ${pageCount} pages. Saved to 'espn_projections.csv'!`);
+    } else {
+        console.error("No player data was captured.");
+    }
+})();
